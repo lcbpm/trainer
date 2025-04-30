@@ -5,7 +5,15 @@
     "version": "0.2.0",
     "configurations": [
 
-       
+
+        {
+            "name":"Python: audio cli",
+            "type": "debugpy",
+            "request":"launch",
+            "program":"${workspaceFolder}/audio/cli.py",
+            "console":"integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python3.11"
+        },
         {
             "name": "Python: finetuning",
             "type": "debugpy",

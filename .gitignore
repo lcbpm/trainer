@@ -1,4 +1,5 @@
 /no_use
 *.xlsx
 .vscode/
-.venv/
+.venv
+.Ds_Store
