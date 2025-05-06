@@ -20,7 +20,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/peft/finetuning.py",
             "console": "integratedTerminal",
-            "python": "${workspaceFolder}/.venv/bin/python3.11"
+            "python": "${workspaceFolder}/.trainer/bin/python3.11"
         },
         {
             "name": "Python: inference",
@@ -28,7 +28,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/peft/inference.py",
             "console": "integratedTerminal",
-            "python": "${workspaceFolder}/.venv/bin/python3.11"
+            "python": "${workspaceFolder}/.trainer/bin/python3.11"
         },
         {
             "name":"Python: generator",
@@ -36,7 +36,7 @@
             "request":"launch",
             "program":"${workspaceFolder}/image/generator.py",
             "console":"integratedTerminal",
-            "python": "${workspaceFolder}/.venv/bin/python3.11"
+            "python": "${workspaceFolder}/.trainer/bin/python3.11"
         }
     ]
 }
