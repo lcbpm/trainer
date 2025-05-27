@@ -6,6 +6,40 @@
     "configurations": [
 
         {
+            "name":"Python: img2vid",
+            "type": "debugpy",
+            "request":"launch",
+            "program":"${workspaceFolder}/image/img2vid.py",
+            "args": [
+                // "--proxy",
+                // "http://localhost:7890",
+                // "--local_model_path",
+                // "${workspaceFolder}/audio/models/models--stabilityai-stable-audio-open-1.0"
+                // 使用环境变量存储token，而不是硬编码
+                // "--token",
+                // "${env:HUGGING_FACE_TOKEN}"
+            ],
+            "console":"integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python3.11"
+        },
+        {
+            "name":"Python: video generator",
+            "type": "debugpy",
+            "request":"launch",
+            "program":"${workspaceFolder}/video/generator.py",
+            "args": [
+                // "--proxy",
+                // "http://localhost:7890",
+                // "--local_model_path",
+                // "${workspaceFolder}/audio/models/models--stabilityai-stable-audio-open-1.0"
+                // 使用环境变量存储token，而不是硬编码
+                // "--token",
+                // "${env:HUGGING_FACE_TOKEN}"
+            ],
+            "console":"integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python3.11"
+        },
+        {
             "name":"Python: audio video",
             "type": "debugpy",
             "request":"launch",
