@@ -7,3 +7,7 @@
 # 环境变量文件，包含敏感信息
 .env
 audio/models/
+saved/
+log/
+log_tensorboard/
+video/mix/

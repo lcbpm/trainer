@@ -1,0 +1,8 @@
+cos_python_sdk_v5==1.9.36
+deepmerge==2.0
+mecord-cli==0.7.392
+p-template-generator==0.2.31
+p-template-res==0.2.9
+requests-toolbelt==1.0.0
+urlparser==0.1.2
+recbole==1.2.1

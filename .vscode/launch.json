@@ -4,12 +4,29 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
-            "name":"Python: img2vid",
+            "name": "Python: run_recbole",
             "type": "debugpy",
-            "request":"launch",
-            "program":"${workspaceFolder}/image/img2vid.py",
+            "request": "launch",
+            "program": "${workspaceFolder}/recommend/run_recbole.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python3.11"
+        },
+        {
+            "name": "Python: show_user_recommendation",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recommend/show_user_recommendation.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python3.11"
+        },
+        {
+            "name": "Python: img2vid",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/image/img2vid.py",
             "args": [
                 // "--proxy",
                 // "http://localhost:7890",
@@ -19,14 +36,14 @@
                 // "--token",
                 // "${env:HUGGING_FACE_TOKEN}"
             ],
-            "console":"integratedTerminal",
+            "console": "integratedTerminal",
             "python": "${workspaceFolder}/.venv/bin/python3.11"
         },
         {
-            "name":"Python: video generator",
+            "name": "Python: video generator",
             "type": "debugpy",
-            "request":"launch",
-            "program":"${workspaceFolder}/video/generator.py",
+            "request": "launch",
+            "program": "${workspaceFolder}/video/generator.py",
             "args": [
                 // "--proxy",
                 // "http://localhost:7890",
@@ -36,14 +53,14 @@
                 // "--token",
                 // "${env:HUGGING_FACE_TOKEN}"
             ],
-            "console":"integratedTerminal",
+            "console": "integratedTerminal",
             "python": "${workspaceFolder}/.venv/bin/python3.11"
         },
         {
-            "name":"Python: audio video",
+            "name": "Python: audio video",
             "type": "debugpy",
-            "request":"launch",
-            "program":"${workspaceFolder}/audio/video.py",
+            "request": "launch",
+            "program": "${workspaceFolder}/audio/video.py",
             "args": [
                 // "--proxy",
                 // "http://localhost:7890",
@@ -53,14 +70,14 @@
                 // "--token",
                 // "${env:HUGGING_FACE_TOKEN}"
             ],
-            "console":"integratedTerminal",
+            "console": "integratedTerminal",
             "python": "${workspaceFolder}/.venv/bin/python3.11"
         },
         {
-            "name":"Python: audio cli",
+            "name": "Python: audio cli",
             "type": "debugpy",
-            "request":"launch",
-            "program":"${workspaceFolder}/audio/cli.py",
+            "request": "launch",
+            "program": "${workspaceFolder}/audio/cli.py",
             "args": [
                 // "--proxy",
                 // "http://localhost:7890",
@@ -70,7 +87,7 @@
                 // "--token",
                 // "${env:HUGGING_FACE_TOKEN}"
             ],
-            "console":"integratedTerminal",
+            "console": "integratedTerminal",
             "python": "${workspaceFolder}/.venv/bin/python3.11"
         },
         {
@@ -90,11 +107,11 @@
             "python": "${workspaceFolder}/.trainer/bin/python3.11"
         },
         {
-            "name":"Python: generator",
+            "name": "Python: generator",
             "type": "debugpy",
-            "request":"launch",
-            "program":"${workspaceFolder}/image/generator.py",
-            "console":"integratedTerminal",
+            "request": "launch",
+            "program": "${workspaceFolder}/image/generator.py",
+            "console": "integratedTerminal",
             "python": "${workspaceFolder}/.trainer/bin/python3.11"
         }
     ]
