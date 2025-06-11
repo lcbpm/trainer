@@ -6,3 +6,18 @@ p-template-res==0.2.9
 requests-toolbelt==1.0.0
 urlparser==0.1.2
 recbole==1.2.1
+
+# 新增依赖（含推荐版本号）
+transformers==4.36.2
+peft==0.8.2
+datasets==2.18.0
+torch==2.1.2
+scipy==1.11.4
+numpy==1.26.4
+Pillow==10.2.0
+moviepy==1.0.3
+opencv-python==4.9.0.80
+tqdm==4.66.2
+diffusers==0.25.0
+lama-cleaner==0.29.1
+loguru==0.7.2
