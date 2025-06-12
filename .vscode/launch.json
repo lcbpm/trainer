@@ -5,6 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python: image2text",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/image2text/generator.py",
+            "args": [
+                // "--proxy",
+                // "http://localhost:7890",
+                // "--local_model_path",
+                // "${workspaceFolder}/audio/models/models--stabilityai-stable-audio-open-1.0"
+                // 使用环境变量存储token，而不是硬编码
+                // "--token",
+                // "${env:HUGGING_FACE_TOKEN}"
+            ],
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python3.11"
+        },
+        {
             "name": "Python: run_recbole",
             "type": "debugpy",
             "request": "launch",
