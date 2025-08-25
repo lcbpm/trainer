@@ -1461,437 +1461,385 @@ public class PaymentServiceParticipant {
 
 这样的实现才真正体现了分布式2PC的特点！
 
-**2. TCC（Try-Confirm-Cancel）模式实现**
+**2. TCC（Try-Confirm-Cancel）分布式模式实现**
 
 ```java
-// TCC事务管理器
-@Service
-public class TCCTransactionManager {
-    
-    private List<TCCParticipant> participants;
-    private TransactionLog transactionLog;
-    
-    public boolean executeTCCTransaction(String transactionId, BusinessContext context) {
-        // 记录事务开始
-        transactionLog.begin(transactionId);
-        
-        try {
-            // Try阶段：尝试执行业务操作
-            boolean allTrySuccess = tryPhase(transactionId, context);
-            
-            if (allTrySuccess) {
-                // Confirm阶段：确认所有操作
-                confirmPhase(transactionId, context);
-                transactionLog.commit(transactionId);
-                return true;
-            } else {
-                // Cancel阶段：取消所有操作
-                cancelPhase(transactionId, context);
-                transactionLog.rollback(transactionId);
-                return false;
-            }
-        } catch (Exception e) {
-            // 异常情况下执行Cancel
-            cancelPhase(transactionId, context);
-            transactionLog.rollback(transactionId);
-            return false;
-        }
-    }
-    
-    private boolean tryPhase(String transactionId, BusinessContext context) {
-        for (TCCParticipant participant : participants) {
-            try {
-                boolean result = participant.tryExecute(transactionId, context);
-                if (!result) {
-                    return false;
-                }
-            } catch (Exception e) {
-                log.error("Try phase failed for participant: {}", participant.getName(), e);
-                return false;
-            }
-        }
-        return true;
-    }
-    
-    private void confirmPhase(String transactionId, BusinessContext context) {
-        for (TCCParticipant participant : participants) {
-            try {
-                participant.confirm(transactionId, context);
-            } catch (Exception e) {
-                log.error("Confirm failed for participant: {}", participant.getName(), e);
-                // 重试机制
-                scheduleRetry(participant, "confirm", transactionId, context);
-            }
-        }
-    }
-    
-    private void cancelPhase(String transactionId, BusinessContext context) {
-        for (TCCParticipant participant : participants) {
-            try {
-                participant.cancel(transactionId, context);
-            } catch (Exception e) {
-                log.error("Cancel failed for participant: {}", participant.getName(), e);
-                // 重试机制
-                scheduleRetry(participant, "cancel", transactionId, context);
-            }
-        }
-    }
-}
-
-// TCC参与者接口
-interface TCCParticipant {
-    boolean tryExecute(String transactionId, BusinessContext context);
-    void confirm(String transactionId, BusinessContext context);
-    void cancel(String transactionId, BusinessContext context);
-    String getName();
-}
-
-// 库存服务TCC实现
-@Service
-public class InventoryServiceTCC implements TCCParticipant {
+// TCC分布式事务管理器（独立服务）
+@RestController
+@RequestMapping("/tcc-coordinator")
+public class DistributedTCCTransactionManager {
     
     @Autowired
-    private InventoryRepository inventoryRepository;
+    private TCCParticipantRegistry participantRegistry;
     
-    @Override
-    public boolean tryExecute(String transactionId, BusinessContext context) {
+    @Autowired
+    private RestTemplate restTemplate;
+    
+    @PostMapping("/execute")
+    public ResponseEntity<TCCTransactionResult> executeTCCTransaction(
+            @RequestBody TCCTransactionRequest request) {
+        
+        String transactionId = UUID.randomUUID().toString();
+        
         try {
+            // 获取分布式参与者服务
+            List<TCCParticipantNode> participants = participantRegistry
+                .getTCCParticipants(request.getBusinessType());
+            
+            // Try阶段：并发调用各个分布式服务
+            boolean allTrySuccess = executeDistributedTryPhase(transactionId, participants, request);
+            
+            if (allTrySuccess) {
+                // Confirm阶段
+                boolean allConfirmed = executeDistributedConfirmPhase(transactionId, participants);
+                return ResponseEntity.ok(TCCTransactionResult.success(transactionId));
+            } else {
+                // Cancel阶段
+                executeDistributedCancelPhase(transactionId, participants);
+                return ResponseEntity.ok(TCCTransactionResult.failure(transactionId, "Try phase failed"));
+            }
+        } catch (Exception e) {
+            return ResponseEntity.status(500)
+                .body(TCCTransactionResult.error(transactionId, e.getMessage()));
+        }
+    }
+    
+    // 分布式Try阶段
+    private boolean executeDistributedTryPhase(String transactionId,
+                                             List<TCCParticipantNode> participants,
+                                             TCCTransactionRequest request) {
+        
+        List<CompletableFuture<Boolean>> tryFutures = new ArrayList<>();
+        
+        // 并发调用所有分布式服务的try接口
+        for (TCCParticipantNode participant : participants) {
+            CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    String url = participant.getBaseUrl() + "/tcc/try";
+                    TCCTryRequest tryRequest = new TCCTryRequest(transactionId, request.getBusinessContext());
+                    
+                    ResponseEntity<TCCTryResponse> response = restTemplate.postForEntity(
+                        url, tryRequest, TCCTryResponse.class);
+                    
+                    return response.getBody() != null && response.getBody().isSuccess();
+                } catch (Exception e) {
+                    log.error("[TCC-Coordinator] Try failed for participant: {} at {}", 
+                        participant.getServiceName(), participant.getBaseUrl(), e);
+                    return false;
+                }
+            });
+            tryFutures.add(future);
+        }
+        
+        return tryFutures.stream()
+            .map(CompletableFuture::join)
+            .allMatch(result -> result);
+    }
+    
+    // 其他方法类似...
+}
+
+// 库存服务TCC实现（独立微服务）
+@RestController
+@RequestMapping("/tcc")
+public class DistributedInventoryServiceTCC {
+    
+    @Autowired
+    private InventoryService inventoryService;
+    
+    @PostMapping("/try")
+    public ResponseEntity<TCCTryResponse> tryExecute(@RequestBody TCCTryRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[InventoryService-TCC] Received try request for transaction: {}", transactionId);
+            
+            BusinessContext context = request.getBusinessContext();
             Long productId = context.getProductId();
             Integer quantity = context.getQuantity();
             
-            // Try阶段：冻结库存
-            return inventoryRepository.freezeInventory(productId, quantity, transactionId);
+            // Try阶段：检查库存并冻结
+            boolean hasStock = inventoryService.checkAvailableStock(productId, quantity);
+            
+            if (hasStock) {
+                boolean frozen = inventoryService.freezeInventory(transactionId, productId, quantity);
+                if (frozen) {
+                    log.info("[InventoryService-TCC] Try successful for transaction: {}", transactionId);
+                    return ResponseEntity.ok(TCCTryResponse.success("库存冻结成功"));
+                }
+            }
+            
+            return ResponseEntity.ok(TCCTryResponse.failure("库存不足"));
+            
         } catch (Exception e) {
-            log.error("Try execute failed", e);
-            return false;
+            log.error("[InventoryService-TCC] Try error for transaction: {}", transactionId, e);
+            return ResponseEntity.status(500).body(TCCTryResponse.error(e.getMessage()));
         }
     }
     
-    @Override
-    public void confirm(String transactionId, BusinessContext context) {
-        // Confirm阶段：确认扣减库存
-        Long productId = context.getProductId();
-        Integer quantity = context.getQuantity();
-        inventoryRepository.confirmReduceInventory(productId, quantity, transactionId);
+    @PostMapping("/confirm")
+    public ResponseEntity<TCCConfirmResponse> confirm(@RequestBody TCCConfirmRequest request) {
+        // 确认扣减库存逻辑...
+        return ResponseEntity.ok(TCCConfirmResponse.success());
     }
     
-    @Override
-    public void cancel(String transactionId, BusinessContext context) {
-        // Cancel阶段：释放冻结的库存
-        Long productId = context.getProductId();
-        Integer quantity = context.getQuantity();
-        inventoryRepository.releaseFrozenInventory(productId, quantity, transactionId);
-    }
-}
-
-// 支付服务TCC实现
-@Service
-public class PaymentServiceTCC implements TCCParticipant {
-    
-    @Autowired
-    private PaymentRepository paymentRepository;
-    
-    @Override
-    public boolean tryExecute(String transactionId, BusinessContext context) {
-        try {
-            // Try阶段：冻结资金
-            return paymentRepository.freezeAmount(context.getUserId(), 
-                context.getAmount(), transactionId);
-        } catch (Exception e) {
-            return false;
-        }
-    }
-    
-    @Override
-    public void confirm(String transactionId, BusinessContext context) {
-        // Confirm阶段：确认扣款
-        paymentRepository.confirmPayment(context.getUserId(), 
-            context.getAmount(), transactionId);
-    }
-    
-    @Override
-    public void cancel(String transactionId, BusinessContext context) {
-        // Cancel阶段：释放冻结资金
-        paymentRepository.releaseFrozenAmount(context.getUserId(), 
-            context.getAmount(), transactionId);
+    @PostMapping("/cancel")
+    public ResponseEntity<TCCCancelResponse> cancel(@RequestBody TCCCancelRequest request) {
+        // 释放冻结库存逻辑...
+        return ResponseEntity.ok(TCCCancelResponse.success());
     }
 }
 ```
 
-**3. Saga模式实现示例**
+**3. Saga模式分布式实现**
 
 ```java
-// Saga事务编排器
-@Service
-public class SagaOrchestrator {
+// Saga分布式编排器（独立服务）
+@RestController
+@RequestMapping("/saga-orchestrator")
+public class DistributedSagaOrchestrator {
     
-    private List<SagaStep> sagaSteps;
-    private CompensationManager compensationManager;
+    @Autowired
+    private SagaStepRegistry stepRegistry;
     
-    public SagaExecutionResult executeSaga(SagaContext context) {
-        List<ExecutedStep> executedSteps = new ArrayList<>();
+    @Autowired
+    private RestTemplate restTemplate;
+    
+    @PostMapping("/execute")
+    public ResponseEntity<SagaExecutionResult> executeSaga(@RequestBody SagaRequest request) {
+        String sagaId = UUID.randomUUID().toString();
         
         try {
-            // 按顺序执行每个步骤
-            for (int i = 0; i < sagaSteps.size(); i++) {
-                SagaStep step = sagaSteps.get(i);
+            // 获取分布式步骤定义
+            List<DistributedSagaStep> steps = stepRegistry.getSagaSteps(request.getBusinessType());
+            
+            // 顺序执行所有分布式步骤
+            for (int i = 0; i < steps.size(); i++) {
+                DistributedSagaStep step = steps.get(i);
                 
-                StepResult result = step.execute(context);
-                executedSteps.add(new ExecutedStep(step, result));
-                
-                if (!result.isSuccess()) {
-                    // 某步骤失败，执行补偿
-                    compensateExecutedSteps(executedSteps);
-                    return SagaExecutionResult.failure("Step " + i + " failed");
+                try {
+                    // 调用远程服务执行步骤
+                    StepResult result = executeDistributedStep(sagaId, step, request.getSagaContext());
+                    
+                    if (!result.isSuccess()) {
+                        // 步骤失败，执行分布式补偿
+                        executeDistributedCompensation(sagaId, steps, i);
+                        return ResponseEntity.ok(SagaExecutionResult.failure(sagaId, "Step failed"));
+                    }
+                } catch (Exception e) {
+                    executeDistributedCompensation(sagaId, steps, i);
+                    return ResponseEntity.status(500)
+                        .body(SagaExecutionResult.error(sagaId, e.getMessage()));
                 }
             }
             
-            return SagaExecutionResult.success();
+            return ResponseEntity.ok(SagaExecutionResult.success(sagaId));
             
         } catch (Exception e) {
-            // 异常情况下执行补偿
-            compensateExecutedSteps(executedSteps);
-            return SagaExecutionResult.failure(e.getMessage());
+            return ResponseEntity.status(500)
+                .body(SagaExecutionResult.error(sagaId, e.getMessage()));
         }
     }
     
-    private void compensateExecutedSteps(List<ExecutedStep> executedSteps) {
-        // 按相反顺序执行补偿
-        for (int i = executedSteps.size() - 1; i >= 0; i--) {
-            ExecutedStep executedStep = executedSteps.get(i);
-            try {
-                executedStep.getStep().compensate(executedStep.getResult());
-            } catch (Exception e) {
-                log.error("Compensation failed for step: {}", 
-                    executedStep.getStep().getName(), e);
-                // 补偿失败需要人工干预或重试
-                compensationManager.scheduleManualCompensation(executedStep);
-            }
-        }
-    }
-}
-
-// Saga步骤接口
-interface SagaStep {
-    StepResult execute(SagaContext context);
-    void compensate(StepResult stepResult);
-    String getName();
-}
-
-// 创建订单步骤
-@Component
-public class CreateOrderStep implements SagaStep {
-    
-    @Autowired
-    private OrderService orderService;
-    
-    @Override
-    public StepResult execute(SagaContext context) {
+    // 执行分布式步骤
+    private StepResult executeDistributedStep(String sagaId, DistributedSagaStep step, SagaContext context) {
         try {
-            Order order = orderService.createOrder(context.getOrderRequest());
-            return StepResult.success(order.getId());
+            String url = step.getServiceUrl() + step.getExecutionEndpoint();
+            SagaStepRequest stepRequest = new SagaStepRequest(sagaId, context);
+            
+            ResponseEntity<SagaStepResponse> response = restTemplate.postForEntity(
+                url, stepRequest, SagaStepResponse.class);
+            
+            return response.getBody() != null && response.getBody().isSuccess() ?
+                StepResult.success(response.getBody().getData()) :
+                StepResult.failure("Step execution failed");
+            
         } catch (Exception e) {
             return StepResult.failure(e.getMessage());
         }
     }
     
-    @Override
-    public void compensate(StepResult stepResult) {
-        if (stepResult.isSuccess()) {
-            // 删除已创建的订单
-            Long orderId = (Long) stepResult.getData();
-            orderService.deleteOrder(orderId);
+    // 执行分布式补偿
+    private void executeDistributedCompensation(String sagaId, List<DistributedSagaStep> steps, int failedStepIndex) {
+        // 按相反顺序调用远程服务的补偿接口
+        for (int i = failedStepIndex - 1; i >= 0; i--) {
+            DistributedSagaStep step = steps.get(i);
+            try {
+                String url = step.getServiceUrl() + step.getCompensationEndpoint();
+                SagaCompensationRequest compensationRequest = new SagaCompensationRequest(sagaId);
+                
+                restTemplate.postForEntity(url, compensationRequest, SagaCompensationResponse.class);
+            } catch (Exception e) {
+                log.error("Compensation failed for step: {} saga: {}", step.getStepName(), sagaId, e);
+            }
         }
-    }
-    
-    @Override
-    public String getName() {
-        return "CreateOrder";
     }
 }
 
-// 扣减库存步骤
-@Component
-public class ReduceInventoryStep implements SagaStep {
+// 订单服务Saga步骤（独立微服务）
+@RestController
+@RequestMapping("/saga")
+public class OrderServiceSagaStep {
     
     @Autowired
-    private InventoryService inventoryService;
+    private OrderService orderService;
     
-    @Override
-    public StepResult execute(SagaContext context) {
+    @PostMapping("/create-order")
+    public ResponseEntity<SagaStepResponse> createOrder(@RequestBody SagaStepRequest request) {
         try {
-            InventoryReduction reduction = inventoryService.reduceInventory(
-                context.getProductId(), context.getQuantity());
-            return StepResult.success(reduction);
-        } catch (InsufficientInventoryException e) {
-            return StepResult.failure("库存不足");
+            SagaContext context = request.getContext();
+            Order order = orderService.createOrder(context.getOrderRequest());
+            
+            return ResponseEntity.ok(SagaStepResponse.success(order.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.ok(SagaStepResponse.failure(e.getMessage()));
         }
     }
     
-    @Override
-    public void compensate(StepResult stepResult) {
-        if (stepResult.isSuccess()) {
-            // 恢复库存
-            InventoryReduction reduction = (InventoryReduction) stepResult.getData();
-            inventoryService.restoreInventory(reduction);
-        }
-    }
-    
-    @Override
-    public String getName() {
-        return "ReduceInventory";
-    }
-}
-
-// 处理支付步骤
-@Component
-public class ProcessPaymentStep implements SagaStep {
-    
-    @Autowired
-    private PaymentService paymentService;
-    
-    @Override
-    public StepResult execute(SagaContext context) {
+    @PostMapping("/compensate-create-order")
+    public ResponseEntity<SagaCompensationResponse> compensateCreateOrder(
+            @RequestBody SagaCompensationRequest request) {
         try {
-            PaymentResult payment = paymentService.processPayment(
-                context.getUserId(), context.getAmount());
-            return StepResult.success(payment);
-        } catch (InsufficientFundsException e) {
-            return StepResult.failure("余额不足");
+            // 补偿逻辑：取消订单
+            Long orderId = getOrderIdFromSaga(request.getSagaId());
+            if (orderId != null) {
+                orderService.cancelOrder(orderId);
+            }
+            return ResponseEntity.ok(SagaCompensationResponse.success());
+        } catch (Exception e) {
+            return ResponseEntity.ok(SagaCompensationResponse.failure(e.getMessage()));
         }
-    }
-    
-    @Override
-    public void compensate(StepResult stepResult) {
-        if (stepResult.isSuccess()) {
-            // 退款
-            PaymentResult payment = (PaymentResult) stepResult.getData();
-            paymentService.refund(payment.getTransactionId());
-        }
-    }
-    
-    @Override
-    public String getName() {
-        return "ProcessPayment";
     }
 }
 ```
 
-**4. 基于消息的最终一致性**
+**4. 基于消息的分布式最终一致性**
 
 ```java
-// 基于消息的分布式事务
-@Service
-public class MessageBasedTransaction {
+// 分布式事件发布服务（独立服务）
+@RestController
+@RequestMapping("/distributed-events")
+public class DistributedEventPublisher {
     
     @Autowired
-    private MessageProducer messageProducer;
+    private RabbitTemplate rabbitTemplate;
     
     @Autowired
     private OutboxEventRepository outboxRepository;
     
-    // 本地事务 + 消息发送（Outbox模式）
+    // 本地事务 + 分布式消息发送（Outbox模式）
+    @PostMapping("/create-order")
     @Transactional
-    public void createOrderWithEvent(OrderRequest orderRequest) {
-        // 1. 执行本地业务操作
-        Order order = orderService.createOrder(orderRequest);
+    public ResponseEntity<EventPublishResult> createOrderWithDistributedEvents(
+            @RequestBody CreateOrderRequest request) {
         
-        // 2. 在同一个事务中保存要发送的事件
-        OutboxEvent event = new OutboxEvent()
-            .setEventType("ORDER_CREATED")
-            .setPayload(JsonUtils.toJson(order))
-            .setStatus(EventStatus.PENDING);
-        
-        outboxRepository.save(event);
-        
-        // 3. 事务提交后，异步发送消息
+        try {
+            // 1. 执行本地业务操作
+            Order order = orderService.createOrder(request);
+            
+            // 2. 在同一事务中保存要发送的分布式事件
+            List<OutboxEvent> events = createDistributedEvents(order);
+            outboxRepository.saveAll(events);
+            
+            return ResponseEntity.ok(EventPublishResult.success(order.getId(), events.size()));
+            
+        } catch (Exception e) {
+            return ResponseEntity.status(500)
+                .body(EventPublishResult.error(e.getMessage()));
+        }
     }
     
-    // 事务消息发送器（定时任务）
-    @Scheduled(fixedDelay = 1000)
-    public void publishPendingEvents() {
+    // 创建分布式事件
+    private List<OutboxEvent> createDistributedEvents(Order order) {
+        List<OutboxEvent> events = new ArrayList<>();
+        
+        // 库存服务事件
+        events.add(new OutboxEvent()
+            .setEventType("ORDER_CREATED_FOR_INVENTORY")
+            .setTargetService("inventory-service")
+            .setRoutingKey("inventory.order.created")
+            .setPayload(JsonUtils.toJson(new InventoryReservationEvent(order)))
+            .setStatus(EventStatus.PENDING));
+        
+        // 支付服务事件
+        events.add(new OutboxEvent()
+            .setEventType("ORDER_CREATED_FOR_PAYMENT")
+            .setTargetService("payment-service")
+            .setRoutingKey("payment.order.created")
+            .setPayload(JsonUtils.toJson(new PaymentProcessEvent(order)))
+            .setStatus(EventStatus.PENDING));
+        
+        return events;
+    }
+    
+    // 分布式事件发送器（定时任务）
+    @Scheduled(fixedDelay = 2000)
+    public void publishPendingDistributedEvents() {
         List<OutboxEvent> pendingEvents = outboxRepository
-            .findByStatus(EventStatus.PENDING);
+            .findByStatusOrderByCreatedTimeAsc(EventStatus.PENDING);
         
         for (OutboxEvent event : pendingEvents) {
             try {
-                // 发送消息到消息队列
-                messageProducer.send(event.getEventType(), event.getPayload());
+                // 发送消息到对应的分布式服务队列
+                rabbitTemplate.convertAndSend(
+                    "distributed.transaction.exchange",
+                    event.getRoutingKey(),
+                    event.getPayload()
+                );
                 
                 // 标记为已发送
                 event.setStatus(EventStatus.SENT);
                 outboxRepository.save(event);
                 
             } catch (Exception e) {
-                log.error("Failed to send event: {}", event.getId(), e);
-                // 可以实现重试机制
+                log.error("Failed to publish distributed event: eventId={}", event.getId(), e);
+                event.setRetryCount(event.getRetryCount() + 1);
+                if (event.getRetryCount() > 3) {
+                    event.setStatus(EventStatus.FAILED);
+                }
+                outboxRepository.save(event);
             }
         }
     }
 }
 
-// 消息消费者（其他服务）
+// 库存服务消息消费者（独立微服务）
 @Component
-public class InventoryMessageConsumer {
+public class DistributedInventoryMessageConsumer {
     
     @Autowired
     private InventoryService inventoryService;
     
-    @RabbitListener(queues = "inventory.order.created")
-    public void handleOrderCreated(OrderCreatedEvent event) {
+    @RabbitListener(queues = "inventory.order.created.queue")
+    public void handleOrderCreatedForInventory(@Payload String message) {
         try {
-            // 处理库存扣减
-            inventoryService.reserveInventory(event.getProductId(), event.getQuantity());
+            InventoryReservationEvent event = JsonUtils.fromJson(message, InventoryReservationEvent.class);
+            
+            // 处理库存预留
+            boolean reserved = inventoryService.reserveInventoryForOrder(
+                event.getProductId(), event.getQuantity(), event.getOrderId());
+            
+            if (reserved) {
+                // 成功后发送确认事件到订单服务
+                publishInventoryReservedEvent(event.getOrderId());
+            } else {
+                // 库存不足，发送失败事件
+                publishInventoryReservationFailedEvent(event.getOrderId());
+            }
             
         } catch (Exception e) {
             log.error("Failed to handle order created event", e);
             // 实现重试或死信队列处理
-            throw new MessageProcessingException("库存扣减失败", e);
+            throw new MessageProcessingException("库存处理失败", e);
         }
     }
-}
-
-// 分布式事务状态机
-@Service
-public class DistributedTransactionStateMachine {
     
-    public enum TransactionState {
-        STARTED, PREPARED, COMMITTED, ABORTED, COMPENSATED
+    private void publishInventoryReservedEvent(Long orderId) {
+        // 发送库存预留成功事件到订单服务
     }
     
-    @Autowired
-    private TransactionStateRepository stateRepository;
-    
-    public void updateTransactionState(String transactionId, 
-                                     TransactionState newState) {
-        TransactionRecord record = stateRepository
-            .findByTransactionId(transactionId);
-        
-        if (record == null) {
-            record = new TransactionRecord()
-                .setTransactionId(transactionId)
-                .setState(newState)
-                .setCreatedTime(LocalDateTime.now());
-        } else {
-            record.setState(newState)
-                  .setUpdatedTime(LocalDateTime.now());
-        }
-        
-        stateRepository.save(record);
-    }
-    
-    // 事务状态恢复
-    @Scheduled(fixedDelay = 30000)
-    public void recoverHangingTransactions() {
-        LocalDateTime timeout = LocalDateTime.now().minusMinutes(5);
-        
-        List<TransactionRecord> hangingTransactions = stateRepository
-            .findByStateAndCreatedTimeBefore(TransactionState.PREPARED, timeout);
-        
-        for (TransactionRecord transaction : hangingTransactions) {
-            // 恢复或回滚超时的事务
-            handleHangingTransaction(transaction);
-        }
+    private void publishInventoryReservationFailedEvent(Long orderId) {
+        // 发送库存预留失败事件
     }
 }
 ```
