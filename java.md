@@ -952,6 +952,959 @@ public class DataSourceConfig {
 - **Saga模式**：长事务拆分，本地事务 + 补偿
 - **最终一致性**：基于消息的异步处理
 
+#### 分布式事务详细实现案例
+
+**1. 2PC（两阶段提交）分布式实现示例**
+
+```java
+// 分布式事务协调器（运行在独立的协调器节点）
+@RestController
+@RequestMapping("/transaction-coordinator")
+public class DistributedTransactionCoordinator {
+    
+    @Autowired
+    private ParticipantRegistry participantRegistry;
+    
+    @Autowired
+    private RestTemplate restTemplate;
+    
+    @Autowired
+    private TransactionLogService transactionLogService;
+    
+    // 分布式事务入口
+    @PostMapping("/execute")
+    public ResponseEntity<TransactionResult> executeDistributedTransaction(
+            @RequestBody DistributedTransactionRequest request) {
+        
+        String transactionId = UUID.randomUUID().toString();
+        
+        // 记录事务开始
+        transactionLogService.logTransactionStart(transactionId, request);
+        
+        try {
+            // 获取所有分布式服务节点
+            List<ParticipantNode> participants = participantRegistry
+                .getParticipants(request.getTransactionType());
+            
+            // 第一阶段：向所有分布式节点发送prepare请求
+            boolean allPrepared = executeDistributedPreparePhase(transactionId, participants, request);
+            
+            if (allPrepared) {
+                // 第二阶段：向所有节点发送commit请求
+                boolean allCommitted = executeDistributedCommitPhase(transactionId, participants);
+                transactionLogService.logTransactionCommit(transactionId);
+                return ResponseEntity.ok(TransactionResult.success(transactionId));
+            } else {
+                // 第二阶段：向所有节点发送rollback请求
+                executeDistributedRollbackPhase(transactionId, participants);
+                transactionLogService.logTransactionRollback(transactionId);
+                return ResponseEntity.ok(TransactionResult.failure(transactionId, "Prepare phase failed"));
+            }
+        } catch (Exception e) {
+            // 异常情况下执行分布式回滚
+            executeDistributedRollbackPhase(transactionId, 
+                participantRegistry.getParticipants(request.getTransactionType()));
+            transactionLogService.logTransactionError(transactionId, e.getMessage());
+            return ResponseEntity.status(500)
+                .body(TransactionResult.error(transactionId, e.getMessage()));
+        }
+    }
+    
+    // 分布式Prepare阶段
+    private boolean executeDistributedPreparePhase(String transactionId, 
+                                                   List<ParticipantNode> participants,
+                                                   DistributedTransactionRequest request) {
+        
+        List<CompletableFuture<Boolean>> prepareFutures = new ArrayList<>();
+        
+        // 并发向所有分布式节点发送prepare请求
+        for (ParticipantNode participant : participants) {
+            CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    // 网络调用远程服务的prepare接口
+                    String url = participant.getBaseUrl() + "/transaction/prepare";
+                    PrepareRequest prepareRequest = new PrepareRequest(transactionId, request.getData());
+                    
+                    ResponseEntity<PrepareResponse> response = restTemplate.postForEntity(
+                        url, prepareRequest, PrepareResponse.class);
+                    
+                    return response.getBody() != null && response.getBody().isSuccess();
+                } catch (Exception e) {
+                    log.error("Prepare failed for participant: {} at {}", 
+                        participant.getServiceName(), participant.getBaseUrl(), e);
+                    return false;
+                }
+            });
+            prepareFutures.add(future);
+        }
+        
+        // 等待所有远程调用完成
+        try {
+            return prepareFutures.stream()
+                .map(CompletableFuture::join)
+                .allMatch(result -> result);
+        } catch (Exception e) {
+            log.error("Prepare phase failed", e);
+            return false;
+        }
+    }
+    
+    // 分布式Commit阶段
+    private boolean executeDistributedCommitPhase(String transactionId, 
+                                                 List<ParticipantNode> participants) {
+        List<CompletableFuture<Boolean>> commitFutures = new ArrayList<>();
+        
+        for (ParticipantNode participant : participants) {
+            CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    // 网络调用远程服务的commit接口
+                    String url = participant.getBaseUrl() + "/transaction/commit";
+                    CommitRequest commitRequest = new CommitRequest(transactionId);
+                    
+                    ResponseEntity<CommitResponse> response = restTemplate.postForEntity(
+                        url, commitRequest, CommitResponse.class);
+                    
+                    return response.getBody() != null && response.getBody().isSuccess();
+                } catch (Exception e) {
+                    log.error("Commit failed for participant: {} at {}", 
+                        participant.getServiceName(), participant.getBaseUrl(), e);
+                    // commit失败需要重试机制
+                    scheduleRetryCommit(participant, transactionId);
+                    return false;
+                }
+            });
+            commitFutures.add(future);
+        }
+        
+        // 等待所有分布式节点commit完成
+        try {
+            return commitFutures.stream()
+                .map(CompletableFuture::join)
+                .allMatch(result -> result);
+        } catch (Exception e) {
+            log.error("Commit phase failed", e);
+            return false;
+        }
+    }
+    
+    // 分布式Rollback阶段
+    private void executeDistributedRollbackPhase(String transactionId, 
+                                                List<ParticipantNode> participants) {
+        // 并发向所有分布式节点发送rollback请求
+        participants.parallelStream().forEach(participant -> {
+            try {
+                String url = participant.getBaseUrl() + "/transaction/rollback";
+                RollbackRequest rollbackRequest = new RollbackRequest(transactionId);
+                
+                ResponseEntity<RollbackResponse> response = restTemplate.postForEntity(
+                    url, rollbackRequest, RollbackResponse.class);
+                
+                if (response.getBody() == null || !response.getBody().isSuccess()) {
+                    log.error("Rollback failed for participant: {} at {}", 
+                        participant.getServiceName(), participant.getBaseUrl());
+                }
+            } catch (Exception e) {
+                log.error("Rollback failed for participant: {} at {}", 
+                    participant.getServiceName(), participant.getBaseUrl(), e);
+            }
+        });
+    }
+}
+
+// 参与者节点信息（代表不同的分布式服务）
+@Entity
+@Table(name = "participant_nodes")
+public class ParticipantNode {
+    private String serviceId;
+    private String serviceName;
+    private String baseUrl;  // 远程服务地址，如：http://order-service:8081
+    private String ipAddress;
+    private int port;
+    private boolean isActive;
+    
+    // getters and setters...
+}
+
+// 参与者注册中心（服务发现）
+@Service
+public class ParticipantRegistry {
+    
+    @Autowired
+    private ParticipantNodeRepository nodeRepository;
+    
+    @Autowired
+    private EurekaClient eurekaClient;  // 或者使用Consul、Nacos等
+    
+    public List<ParticipantNode> getParticipants(String transactionType) {
+        // 根据事务类型获取相关的分布式服务节点
+        switch (transactionType) {
+            case "ORDER_TRANSACTION":
+                return Arrays.asList(
+                    findServiceNode("order-service"),
+                    findServiceNode("inventory-service"),
+                    findServiceNode("payment-service")
+                );
+            case "TRANSFER_TRANSACTION":
+                return Arrays.asList(
+                    findServiceNode("account-service"),
+                    findServiceNode("audit-service")
+                );
+            default:
+                return nodeRepository.findByIsActiveTrue();
+        }
+    }
+    
+    private ParticipantNode findServiceNode(String serviceName) {
+        // 从服务注册中心获取服务实例
+        List<InstanceInfo> instances = eurekaClient.getInstancesByVipAddress(serviceName, false);
+        
+        if (!instances.isEmpty()) {
+            InstanceInfo instance = instances.get(0);  // 简化处理，实际可以负载均衡
+            return new ParticipantNode()
+                .setServiceName(serviceName)
+                .setBaseUrl("http://" + instance.getHostName() + ":" + instance.getPort())
+                .setIpAddress(instance.getIPAddr())
+                .setPort(instance.getPort())
+                .setActive(true);
+        }
+        
+        throw new ServiceNotFoundException("Service not found: " + serviceName);
+    }
+}
+```
+
+```java
+// 订单服务（独立的微服务，运行在不同的JVM/容器中）
+@RestController
+@RequestMapping("/transaction")
+public class OrderServiceParticipant {
+    
+    @Autowired
+    private OrderService orderService;
+    
+    @Autowired
+    private TransactionResourceManager resourceManager;
+    
+    // 处理来自协调器的prepare请求
+    @PostMapping("/prepare")
+    public ResponseEntity<PrepareResponse> prepare(@RequestBody PrepareRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[OrderService] Received prepare request for transaction: {}", transactionId);
+            
+            // 执行业务逻辑检查和资源预留
+            OrderData orderData = (OrderData) request.getData();
+            
+            // 1. 验证订单数据
+            if (!orderService.validateOrder(orderData)) {
+                return ResponseEntity.ok(PrepareResponse.failure("订单数据无效"));
+            }
+            
+            // 2. 预留资源（但不真正执行业务操作）
+            boolean resourceReserved = resourceManager.reserveResources(transactionId, orderData);
+            
+            if (resourceReserved) {
+                log.info("[OrderService] Prepare successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(PrepareResponse.success());
+            } else {
+                log.warn("[OrderService] Prepare failed - resource reservation failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(PrepareResponse.failure("资源预留失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[OrderService] Prepare error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(PrepareResponse.failure(e.getMessage()));
+        }
+    }
+    
+    // 处理来自协调器的commit请求
+    @PostMapping("/commit")
+    public ResponseEntity<CommitResponse> commit(@RequestBody CommitRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[OrderService] Received commit request for transaction: {}", transactionId);
+            
+            // 执行真正的业务操作
+            boolean committed = resourceManager.commitTransaction(transactionId);
+            
+            if (committed) {
+                log.info("[OrderService] Commit successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(CommitResponse.success());
+            } else {
+                log.error("[OrderService] Commit failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(CommitResponse.failure("提交失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[OrderService] Commit error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(CommitResponse.failure(e.getMessage()));
+        }
+    }
+    
+    // 处理来自协调器的rollback请求
+    @PostMapping("/rollback")
+    public ResponseEntity<RollbackResponse> rollback(@RequestBody RollbackRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[OrderService] Received rollback request for transaction: {}", transactionId);
+            
+            // 清理预留的资源
+            boolean rolledBack = resourceManager.rollbackTransaction(transactionId);
+            
+            if (rolledBack) {
+                log.info("[OrderService] Rollback successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(RollbackResponse.success());
+            } else {
+                log.warn("[OrderService] Rollback failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(RollbackResponse.failure("回滚失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[OrderService] Rollback error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(RollbackResponse.failure(e.getMessage()));
+        }
+    }
+}
+
+// 库存服务（另一个独立的微服务）
+@RestController
+@RequestMapping("/transaction")
+public class InventoryServiceParticipant {
+    
+    @Autowired
+    private InventoryService inventoryService;
+    
+    @PostMapping("/prepare")
+    public ResponseEntity<PrepareResponse> prepare(@RequestBody PrepareRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[InventoryService] Received prepare request for transaction: {}", transactionId);
+            
+            OrderData orderData = (OrderData) request.getData();
+            
+            // 检查库存是否充足
+            boolean hasEnoughStock = inventoryService.checkStock(
+                orderData.getProductId(), orderData.getQuantity());
+            
+            if (hasEnoughStock) {
+                // 预留库存（锁定但不真正扣减）
+                boolean reserved = inventoryService.reserveStock(
+                    transactionId, orderData.getProductId(), orderData.getQuantity());
+                
+                if (reserved) {
+                    log.info("[InventoryService] Prepare successful for transaction: {}", transactionId);
+                    return ResponseEntity.ok(PrepareResponse.success());
+                }
+            }
+            
+            log.warn("[InventoryService] Prepare failed - insufficient stock for transaction: {}", transactionId);
+            return ResponseEntity.ok(PrepareResponse.failure("库存不足"));
+            
+        } catch (Exception e) {
+            log.error("[InventoryService] Prepare error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(PrepareResponse.failure(e.getMessage()));
+        }
+    }
+    
+    @PostMapping("/commit")
+    public ResponseEntity<CommitResponse> commit(@RequestBody CommitRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[InventoryService] Received commit request for transaction: {}", transactionId);
+            
+            // 真正扣减库存
+            boolean committed = inventoryService.confirmStockReduction(transactionId);
+            
+            if (committed) {
+                log.info("[InventoryService] Commit successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(CommitResponse.success());
+            } else {
+                log.error("[InventoryService] Commit failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(CommitResponse.failure("库存扣减失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[InventoryService] Commit error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(CommitResponse.failure(e.getMessage()));
+        }
+    }
+    
+    @PostMapping("/rollback")
+    public ResponseEntity<RollbackResponse> rollback(@RequestBody RollbackRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[InventoryService] Received rollback request for transaction: {}", transactionId);
+            
+            // 释放预留的库存
+            boolean rolledBack = inventoryService.releaseReservedStock(transactionId);
+            
+            if (rolledBack) {
+                log.info("[InventoryService] Rollback successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(RollbackResponse.success());
+            } else {
+                log.warn("[InventoryService] Rollback failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(RollbackResponse.failure("库存释放失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[InventoryService] Rollback error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(RollbackResponse.failure(e.getMessage()));
+        }
+    }
+}
+
+// 支付服务（第三个独立的微服务）
+@RestController
+@RequestMapping("/transaction")
+public class PaymentServiceParticipant {
+    
+    @Autowired
+    private PaymentService paymentService;
+    
+    @PostMapping("/prepare")
+    public ResponseEntity<PrepareResponse> prepare(@RequestBody PrepareRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[PaymentService] Received prepare request for transaction: {}", transactionId);
+            
+            OrderData orderData = (OrderData) request.getData();
+            
+            // 检查账户余额
+            boolean hasEnoughBalance = paymentService.checkBalance(
+                orderData.getUserId(), orderData.getTotalAmount());
+            
+            if (hasEnoughBalance) {
+                // 冻结资金（预留但不真正扣款）
+                boolean frozen = paymentService.freezeAmount(
+                    transactionId, orderData.getUserId(), orderData.getTotalAmount());
+                
+                if (frozen) {
+                    log.info("[PaymentService] Prepare successful for transaction: {}", transactionId);
+                    return ResponseEntity.ok(PrepareResponse.success());
+                }
+            }
+            
+            log.warn("[PaymentService] Prepare failed - insufficient balance for transaction: {}", transactionId);
+            return ResponseEntity.ok(PrepareResponse.failure("余额不足"));
+            
+        } catch (Exception e) {
+            log.error("[PaymentService] Prepare error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(PrepareResponse.failure(e.getMessage()));
+        }
+    }
+    
+    @PostMapping("/commit")
+    public ResponseEntity<CommitResponse> commit(@RequestBody CommitRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[PaymentService] Received commit request for transaction: {}", transactionId);
+            
+            // 真正扣款
+            boolean committed = paymentService.confirmPayment(transactionId);
+            
+            if (committed) {
+                log.info("[PaymentService] Commit successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(CommitResponse.success());
+            } else {
+                log.error("[PaymentService] Commit failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(CommitResponse.failure("扣款失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[PaymentService] Commit error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(CommitResponse.failure(e.getMessage()));
+        }
+    }
+    
+    @PostMapping("/rollback")
+    public ResponseEntity<RollbackResponse> rollback(@RequestBody RollbackRequest request) {
+        String transactionId = request.getTransactionId();
+        
+        try {
+            log.info("[PaymentService] Received rollback request for transaction: {}", transactionId);
+            
+            // 解冻资金
+            boolean rolledBack = paymentService.unfreezeAmount(transactionId);
+            
+            if (rolledBack) {
+                log.info("[PaymentService] Rollback successful for transaction: {}", transactionId);
+                return ResponseEntity.ok(RollbackResponse.success());
+            } else {
+                log.warn("[PaymentService] Rollback failed for transaction: {}", transactionId);
+                return ResponseEntity.ok(RollbackResponse.failure("资金解冻失败"));
+            }
+            
+        } catch (Exception e) {
+            log.error("[PaymentService] Rollback error for transaction: {}", transactionId, e);
+            return ResponseEntity.ok(RollbackResponse.failure(e.getMessage()));
+        }
+    }
+}
+```
+
+**真正的分布式特征体现：**
+
+1. **网络通信**：协调器通过HTTP/RPC与远程服务通信
+2. **服务发现**：使用Eureka等注册中心发现分布式服务节点
+3. **独立部署**：每个参与者都是独立的微服务，运行在不同JVM/容器中
+4. **网络异常处理**：处理网络超时、连接失败等分布式环境特有问题
+5. **并发处理**：并发向多个远程服务发送请求
+6. **服务地址管理**：维护各个分布式服务的网络地址
+
+这样的实现才真正体现了分布式2PC的特点！
+
+**2. TCC（Try-Confirm-Cancel）模式实现**
+
+```java
+// TCC事务管理器
+@Service
+public class TCCTransactionManager {
+    
+    private List<TCCParticipant> participants;
+    private TransactionLog transactionLog;
+    
+    public boolean executeTCCTransaction(String transactionId, BusinessContext context) {
+        // 记录事务开始
+        transactionLog.begin(transactionId);
+        
+        try {
+            // Try阶段：尝试执行业务操作
+            boolean allTrySuccess = tryPhase(transactionId, context);
+            
+            if (allTrySuccess) {
+                // Confirm阶段：确认所有操作
+                confirmPhase(transactionId, context);
+                transactionLog.commit(transactionId);
+                return true;
+            } else {
+                // Cancel阶段：取消所有操作
+                cancelPhase(transactionId, context);
+                transactionLog.rollback(transactionId);
+                return false;
+            }
+        } catch (Exception e) {
+            // 异常情况下执行Cancel
+            cancelPhase(transactionId, context);
+            transactionLog.rollback(transactionId);
+            return false;
+        }
+    }
+    
+    private boolean tryPhase(String transactionId, BusinessContext context) {
+        for (TCCParticipant participant : participants) {
+            try {
+                boolean result = participant.tryExecute(transactionId, context);
+                if (!result) {
+                    return false;
+                }
+            } catch (Exception e) {
+                log.error("Try phase failed for participant: {}", participant.getName(), e);
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    private void confirmPhase(String transactionId, BusinessContext context) {
+        for (TCCParticipant participant : participants) {
+            try {
+                participant.confirm(transactionId, context);
+            } catch (Exception e) {
+                log.error("Confirm failed for participant: {}", participant.getName(), e);
+                // 重试机制
+                scheduleRetry(participant, "confirm", transactionId, context);
+            }
+        }
+    }
+    
+    private void cancelPhase(String transactionId, BusinessContext context) {
+        for (TCCParticipant participant : participants) {
+            try {
+                participant.cancel(transactionId, context);
+            } catch (Exception e) {
+                log.error("Cancel failed for participant: {}", participant.getName(), e);
+                // 重试机制
+                scheduleRetry(participant, "cancel", transactionId, context);
+            }
+        }
+    }
+}
+
+// TCC参与者接口
+interface TCCParticipant {
+    boolean tryExecute(String transactionId, BusinessContext context);
+    void confirm(String transactionId, BusinessContext context);
+    void cancel(String transactionId, BusinessContext context);
+    String getName();
+}
+
+// 库存服务TCC实现
+@Service
+public class InventoryServiceTCC implements TCCParticipant {
+    
+    @Autowired
+    private InventoryRepository inventoryRepository;
+    
+    @Override
+    public boolean tryExecute(String transactionId, BusinessContext context) {
+        try {
+            Long productId = context.getProductId();
+            Integer quantity = context.getQuantity();
+            
+            // Try阶段：冻结库存
+            return inventoryRepository.freezeInventory(productId, quantity, transactionId);
+        } catch (Exception e) {
+            log.error("Try execute failed", e);
+            return false;
+        }
+    }
+    
+    @Override
+    public void confirm(String transactionId, BusinessContext context) {
+        // Confirm阶段：确认扣减库存
+        Long productId = context.getProductId();
+        Integer quantity = context.getQuantity();
+        inventoryRepository.confirmReduceInventory(productId, quantity, transactionId);
+    }
+    
+    @Override
+    public void cancel(String transactionId, BusinessContext context) {
+        // Cancel阶段：释放冻结的库存
+        Long productId = context.getProductId();
+        Integer quantity = context.getQuantity();
+        inventoryRepository.releaseFrozenInventory(productId, quantity, transactionId);
+    }
+}
+
+// 支付服务TCC实现
+@Service
+public class PaymentServiceTCC implements TCCParticipant {
+    
+    @Autowired
+    private PaymentRepository paymentRepository;
+    
+    @Override
+    public boolean tryExecute(String transactionId, BusinessContext context) {
+        try {
+            // Try阶段：冻结资金
+            return paymentRepository.freezeAmount(context.getUserId(), 
+                context.getAmount(), transactionId);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    @Override
+    public void confirm(String transactionId, BusinessContext context) {
+        // Confirm阶段：确认扣款
+        paymentRepository.confirmPayment(context.getUserId(), 
+            context.getAmount(), transactionId);
+    }
+    
+    @Override
+    public void cancel(String transactionId, BusinessContext context) {
+        // Cancel阶段：释放冻结资金
+        paymentRepository.releaseFrozenAmount(context.getUserId(), 
+            context.getAmount(), transactionId);
+    }
+}
+```
+
+**3. Saga模式实现示例**
+
+```java
+// Saga事务编排器
+@Service
+public class SagaOrchestrator {
+    
+    private List<SagaStep> sagaSteps;
+    private CompensationManager compensationManager;
+    
+    public SagaExecutionResult executeSaga(SagaContext context) {
+        List<ExecutedStep> executedSteps = new ArrayList<>();
+        
+        try {
+            // 按顺序执行每个步骤
+            for (int i = 0; i < sagaSteps.size(); i++) {
+                SagaStep step = sagaSteps.get(i);
+                
+                StepResult result = step.execute(context);
+                executedSteps.add(new ExecutedStep(step, result));
+                
+                if (!result.isSuccess()) {
+                    // 某步骤失败，执行补偿
+                    compensateExecutedSteps(executedSteps);
+                    return SagaExecutionResult.failure("Step " + i + " failed");
+                }
+            }
+            
+            return SagaExecutionResult.success();
+            
+        } catch (Exception e) {
+            // 异常情况下执行补偿
+            compensateExecutedSteps(executedSteps);
+            return SagaExecutionResult.failure(e.getMessage());
+        }
+    }
+    
+    private void compensateExecutedSteps(List<ExecutedStep> executedSteps) {
+        // 按相反顺序执行补偿
+        for (int i = executedSteps.size() - 1; i >= 0; i--) {
+            ExecutedStep executedStep = executedSteps.get(i);
+            try {
+                executedStep.getStep().compensate(executedStep.getResult());
+            } catch (Exception e) {
+                log.error("Compensation failed for step: {}", 
+                    executedStep.getStep().getName(), e);
+                // 补偿失败需要人工干预或重试
+                compensationManager.scheduleManualCompensation(executedStep);
+            }
+        }
+    }
+}
+
+// Saga步骤接口
+interface SagaStep {
+    StepResult execute(SagaContext context);
+    void compensate(StepResult stepResult);
+    String getName();
+}
+
+// 创建订单步骤
+@Component
+public class CreateOrderStep implements SagaStep {
+    
+    @Autowired
+    private OrderService orderService;
+    
+    @Override
+    public StepResult execute(SagaContext context) {
+        try {
+            Order order = orderService.createOrder(context.getOrderRequest());
+            return StepResult.success(order.getId());
+        } catch (Exception e) {
+            return StepResult.failure(e.getMessage());
+        }
+    }
+    
+    @Override
+    public void compensate(StepResult stepResult) {
+        if (stepResult.isSuccess()) {
+            // 删除已创建的订单
+            Long orderId = (Long) stepResult.getData();
+            orderService.deleteOrder(orderId);
+        }
+    }
+    
+    @Override
+    public String getName() {
+        return "CreateOrder";
+    }
+}
+
+// 扣减库存步骤
+@Component
+public class ReduceInventoryStep implements SagaStep {
+    
+    @Autowired
+    private InventoryService inventoryService;
+    
+    @Override
+    public StepResult execute(SagaContext context) {
+        try {
+            InventoryReduction reduction = inventoryService.reduceInventory(
+                context.getProductId(), context.getQuantity());
+            return StepResult.success(reduction);
+        } catch (InsufficientInventoryException e) {
+            return StepResult.failure("库存不足");
+        }
+    }
+    
+    @Override
+    public void compensate(StepResult stepResult) {
+        if (stepResult.isSuccess()) {
+            // 恢复库存
+            InventoryReduction reduction = (InventoryReduction) stepResult.getData();
+            inventoryService.restoreInventory(reduction);
+        }
+    }
+    
+    @Override
+    public String getName() {
+        return "ReduceInventory";
+    }
+}
+
+// 处理支付步骤
+@Component
+public class ProcessPaymentStep implements SagaStep {
+    
+    @Autowired
+    private PaymentService paymentService;
+    
+    @Override
+    public StepResult execute(SagaContext context) {
+        try {
+            PaymentResult payment = paymentService.processPayment(
+                context.getUserId(), context.getAmount());
+            return StepResult.success(payment);
+        } catch (InsufficientFundsException e) {
+            return StepResult.failure("余额不足");
+        }
+    }
+    
+    @Override
+    public void compensate(StepResult stepResult) {
+        if (stepResult.isSuccess()) {
+            // 退款
+            PaymentResult payment = (PaymentResult) stepResult.getData();
+            paymentService.refund(payment.getTransactionId());
+        }
+    }
+    
+    @Override
+    public String getName() {
+        return "ProcessPayment";
+    }
+}
+```
+
+**4. 基于消息的最终一致性**
+
+```java
+// 基于消息的分布式事务
+@Service
+public class MessageBasedTransaction {
+    
+    @Autowired
+    private MessageProducer messageProducer;
+    
+    @Autowired
+    private OutboxEventRepository outboxRepository;
+    
+    // 本地事务 + 消息发送（Outbox模式）
+    @Transactional
+    public void createOrderWithEvent(OrderRequest orderRequest) {
+        // 1. 执行本地业务操作
+        Order order = orderService.createOrder(orderRequest);
+        
+        // 2. 在同一个事务中保存要发送的事件
+        OutboxEvent event = new OutboxEvent()
+            .setEventType("ORDER_CREATED")
+            .setPayload(JsonUtils.toJson(order))
+            .setStatus(EventStatus.PENDING);
+        
+        outboxRepository.save(event);
+        
+        // 3. 事务提交后，异步发送消息
+    }
+    
+    // 事务消息发送器（定时任务）
+    @Scheduled(fixedDelay = 1000)
+    public void publishPendingEvents() {
+        List<OutboxEvent> pendingEvents = outboxRepository
+            .findByStatus(EventStatus.PENDING);
+        
+        for (OutboxEvent event : pendingEvents) {
+            try {
+                // 发送消息到消息队列
+                messageProducer.send(event.getEventType(), event.getPayload());
+                
+                // 标记为已发送
+                event.setStatus(EventStatus.SENT);
+                outboxRepository.save(event);
+                
+            } catch (Exception e) {
+                log.error("Failed to send event: {}", event.getId(), e);
+                // 可以实现重试机制
+            }
+        }
+    }
+}
+
+// 消息消费者（其他服务）
+@Component
+public class InventoryMessageConsumer {
+    
+    @Autowired
+    private InventoryService inventoryService;
+    
+    @RabbitListener(queues = "inventory.order.created")
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        try {
+            // 处理库存扣减
+            inventoryService.reserveInventory(event.getProductId(), event.getQuantity());
+            
+        } catch (Exception e) {
+            log.error("Failed to handle order created event", e);
+            // 实现重试或死信队列处理
+            throw new MessageProcessingException("库存扣减失败", e);
+        }
+    }
+}
+
+// 分布式事务状态机
+@Service
+public class DistributedTransactionStateMachine {
+    
+    public enum TransactionState {
+        STARTED, PREPARED, COMMITTED, ABORTED, COMPENSATED
+    }
+    
+    @Autowired
+    private TransactionStateRepository stateRepository;
+    
+    public void updateTransactionState(String transactionId, 
+                                     TransactionState newState) {
+        TransactionRecord record = stateRepository
+            .findByTransactionId(transactionId);
+        
+        if (record == null) {
+            record = new TransactionRecord()
+                .setTransactionId(transactionId)
+                .setState(newState)
+                .setCreatedTime(LocalDateTime.now());
+        } else {
+            record.setState(newState)
+                  .setUpdatedTime(LocalDateTime.now());
+        }
+        
+        stateRepository.save(record);
+    }
+    
+    // 事务状态恢复
+    @Scheduled(fixedDelay = 30000)
+    public void recoverHangingTransactions() {
+        LocalDateTime timeout = LocalDateTime.now().minusMinutes(5);
+        
+        List<TransactionRecord> hangingTransactions = stateRepository
+            .findByStateAndCreatedTimeBefore(TransactionState.PREPARED, timeout);
+        
+        for (TransactionRecord transaction : hangingTransactions) {
+            // 恢复或回滚超时的事务
+            handleHangingTransaction(transaction);
+        }
+    }
+}
+```
+
+**分布式事务选择指南：**
+
+| 模式 | 一致性 | 性能 | 复杂度 | 适用场景 |
+|------|--------|------|--------|----------|
+| 2PC | 强一致性 | 低 | 中等 | 金融、核心业务 |
+| TCC | 强一致性 | 中等 | 高 | 对一致性要求高的业务 |
+| Saga | 最终一致性 | 高 | 中等 | 长流程业务 |
+| 消息队列 | 最终一致性 | 高 | 低 | 大部分业务场景 |
+
 ### 6.3 消息队列
 **Q: 消息队列的作用？**
 - 解耦：降低系统间依赖
