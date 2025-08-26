@@ -633,6 +633,8 @@ public class WebAppClassLoader extends ClassLoader {
 双亲委派模型虽然有一定的局限性（如无法实现真正的热部署），但其设计充分考虑了Java平台的安全性和稳定性要求，是经过深思熟虑的设计选择。
 
 ### 1.4 JVM 调优实战
+
+#### 1.4.1 JVM调优基础参数配置
 ```bash
 # 常用JVM参数
 -Xms4g -Xmx4g                    # 堆内存大小
@@ -644,16 +646,1031 @@ public class WebAppClassLoader extends ClassLoader {
 -XX:+HeapDumpOnOutOfMemoryError  # OOM时生成堆转储
 ```
 
+#### 1.4.2 实战案例一：高并发电商系统GC调优
+
+**问题背景：**
+某电商平台在双11期间，用户下单时系统响应缓慢，平均响应时间从100ms增加到2秒以上。
+
+**系统配置：**
+- 8核16G内存服务器
+- 日均订单量：100万+
+- 峰值QPS：5000+
+
+**初始JVM配置：**
+```bash
+-Xms8g -Xmx8g
+-XX:+UseParallelGC
+-XX:ParallelGCThreads=8
+-XX:+PrintGCDetails
+-XX:+PrintGCTimeStamps
+```
+
+**问题分析过程：**
+
+1. **GC日志分析**
+```bash
+# GC日志显示频繁的Full GC
+2023-11-11T10:15:30.123+0800: [Full GC (Ergonomics) 
+[PSYoungGen: 0K->0K(2048000K)] 
+[ParOldGen: 6291456K->6291456K(6291456K)] 
+6291456K->6291456K(8339456K), 
+[Metaspace: 89543K->89543K(1134592K)], 3.2156789 secs]
+
+# 分析结果：
+# 1. 老年代几乎满了（6G/6G）
+# 2. Full GC耗时3.2秒
+# 3. GC后老年代空间没有释放
+```
+
+2. **堆内存分析**
+```bash
+# 生成堆转储文件
+jmap -dump:format=b,file=heap_dump.hprof 12345
+
+# 使用MAT工具分析发现：
+# - 订单缓存占用60%内存（约4.8G）
+# - 大量订单对象没有及时释放
+# - 存在内存泄漏风险
+```
+
+3. **代码问题定位**
+```java
+// 问题代码：订单缓存策略不当
+@Service
+public class OrderService {
+    // 问题：使用static Map缓存，没有过期机制
+    private static final Map<String, Order> ORDER_CACHE = new ConcurrentHashMap<>();
+    
+    public Order getOrder(String orderId) {
+        Order order = ORDER_CACHE.get(orderId);
+        if (order == null) {
+            order = orderRepository.findById(orderId);
+            ORDER_CACHE.put(orderId, order);  // 内存泄漏源头
+        }
+        return order;
+    }
+}
+```
+
+**优化方案：**
+
+1. **代码优化**
+```java
+// 优化后：使用Caffeine缓存，支持过期和容量限制
+@Service
+public class OrderService {
+    
+    private final Cache<String, Order> orderCache = Caffeine.newBuilder()
+            .maximumSize(50000)  // 最大缓存5万个订单
+            .expireAfterWrite(Duration.ofHours(2))  // 2小时过期
+            .expireAfterAccess(Duration.ofMinutes(30))  // 30分钟未访问过期
+            .recordStats()  // 开启统计
+            .build();
+    
+    public Order getOrder(String orderId) {
+        return orderCache.get(orderId, key -> orderRepository.findById(key));
+    }
+    
+    // 监控缓存效果
+    @Scheduled(fixedRate = 60000)
+    public void logCacheStats() {
+        CacheStats stats = orderCache.stats();
+        log.info("Order cache stats: hitRate={}, evictionCount={}, size={}",
+            stats.hitRate(), stats.evictionCount(), orderCache.estimatedSize());
+    }
+}
+```
+
+2. **JVM参数优化**
+```bash
+# 优化后的JVM配置
+-Xms8g -Xmx8g
+-XX:+UseG1GC                    # 改用G1收集器
+-XX:MaxGCPauseMillis=100       # 目标停顿时间100ms
+-XX:G1HeapRegionSize=16m       # 设置Region大小
+-XX:G1NewSizePercent=30        # 新生代最小比例
+-XX:G1MaxNewSizePercent=50     # 新生代最大比例
+-XX:+G1UseAdaptiveIHOP         # 自适应IHOP
+-XX:G1MixedGCCountTarget=8     # 混合GC目标次数
+-XX:+UnlockExperimentalVMOptions
+-XX:+UseJVMCICompiler          # 开启JIT编译优化
+
+# GC日志配置
+-Xloggc:/var/log/gc/gc.log
+-XX:+UseGCLogFileRotation
+-XX:NumberOfGCLogFiles=5
+-XX:GCLogFileSize=100M
+-XX:+PrintGCDetails
+-XX:+PrintGCTimeStamps
+-XX:+PrintGCApplicationStoppedTime
+```
+
+**优化效果：**
+- 平均GC停顿时间：从3.2秒降低到80ms
+- 系统响应时间：从2秒降低到120ms
+- 内存使用率：从95%降低到65%
+- 系统吞吐量：提升40%
+
+#### 1.4.3 实战案例二：大数据处理系统内存溢出优化
+
+**问题背景：**
+某数据分析系统处理大文件时频繁出现OOM，需要处理单个文件大小2-5GB的CSV数据。
+
+**系统配置：**
+- 32核64G内存服务器
+- 处理文件：2-5GB CSV文件
+- 数据行数：1000万+
+
+**问题现象：**
+```bash
+java.lang.OutOfMemoryError: Java heap space
+    at java.util.Arrays.copyOf(Arrays.java:3210)
+    at java.util.ArrayList.grow(ArrayList.java:267)
+    at java.util.ArrayList.ensureExplicitCapacity(ArrayList.java:241)
+    at com.example.DataProcessor.processLargeFile(DataProcessor.java:45)
+```
+
+**原始代码问题：**
+```java
+// 问题代码：一次性加载整个文件到内存
+@Service
+public class DataProcessor {
+    
+    public void processLargeFile(String filePath) {
+        try {
+            // 问题1：一次性读取所有行到内存
+            List<String> allLines = Files.readAllLines(Paths.get(filePath));
+            
+            List<ProcessedData> results = new ArrayList<>();
+            for (String line : allLines) {
+                ProcessedData data = processLine(line);
+                results.add(data);  // 问题2：结果也全部保存在内存中
+            }
+            
+            // 问题3：批量保存，占用更多内存
+            dataRepository.saveAll(results);
+            
+        } catch (IOException e) {
+            throw new RuntimeException("文件处理失败", e);
+        }
+    }
+}
+```
+
+**内存分析：**
+```bash
+# 使用jmap分析内存占用
+jmap -histo:live <pid> | head -20
+
+# 分析结果显示：
+# 1. String对象占用45% 内存
+# 2. ArrayList占用25% 内存
+# 3. ProcessedData对象占用20% 内存
+# 4. 总内存占用超过分配的堆空间
+```
+
+**优化方案：**
+
+1. **流式处理改造**
+```java
+// 优化后：使用流式处理，分批处理数据
+@Service
+public class DataProcessor {
+    
+    private static final int BATCH_SIZE = 1000;  // 批处理大小
+    
+    public void processLargeFile(String filePath) {
+        try (Stream<String> lines = Files.lines(Paths.get(filePath))) {
+            
+            // 使用流式处理，分批处理
+            lines.parallel()  // 并行处理提高效率
+                 .map(this::processLine)
+                 .collect(Collectors.groupingBy(
+                     data -> data.hashCode() % BATCH_SIZE,  // 分组
+                     Collectors.toList()))
+                 .values()
+                 .parallelStream()
+                 .forEach(this::saveBatch);  // 分批保存
+                 
+        } catch (IOException e) {
+            throw new RuntimeException("文件处理失败", e);
+        }
+    }
+    
+    private void saveBatch(List<ProcessedData> batch) {
+        try {
+            dataRepository.saveAll(batch);
+            batch.clear();  // 及时清理内存
+        } catch (Exception e) {
+            log.error("批量保存失败", e);
+        }
+    }
+    
+    // 另一种方案：使用缓冲区分块读取
+    public void processLargeFileWithBuffer(String filePath) {
+        try (BufferedReader reader = Files.newBufferedReader(Paths.get(filePath))) {
+            
+            List<ProcessedData> batch = new ArrayList<>(BATCH_SIZE);
+            String line;
+            
+            while ((line = reader.readLine()) != null) {
+                ProcessedData data = processLine(line);
+                batch.add(data);
+                
+                if (batch.size() >= BATCH_SIZE) {
+                    saveBatch(batch);
+                    batch = new ArrayList<>(BATCH_SIZE);  // 创建新批次
+                }
+            }
+            
+            // 处理最后一批数据
+            if (!batch.isEmpty()) {
+                saveBatch(batch);
+            }
+            
+        } catch (IOException e) {
+            throw new RuntimeException("文件处理失败", e);
+        }
+    }
+}
+```
+
+2. **JVM参数调优**
+```bash
+# 针对大数据处理的JVM配置
+-Xms32g -Xmx32g                  # 大内存配置
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:G1HeapRegionSize=32m          # 大region适合大对象
+-XX:+G1UseAdaptiveIHOP
+-XX:G1MixedGCLiveThresholdPercent=85
+
+# 针对大对象的优化
+-XX:G1HeapWastePercent=10
+-XX:+UseLargePages                # 使用大页内存
+-XX:LargePageSizeInBytes=2m
+
+# 并行GC线程数（根据CPU核数调整）
+-XX:ParallelGCThreads=16
+-XX:ConcGCThreads=4
+
+# 元空间配置（避免类加载OOM）
+-XX:MetaspaceSize=512m
+-XX:MaxMetaspaceSize=1g
+
+# 直接内存配置（NIO使用）
+-XX:MaxDirectMemorySize=8g
+
+# 内存泄漏检测
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/heapdump/
+```
+
+3. **内存监控和告警**
+```java
+// 内存监控组件
+@Component
+public class MemoryMonitor {
+    
+    private final MeterRegistry meterRegistry;
+    private final MemoryMXBean memoryMXBean;
+    
+    public MemoryMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        this.memoryMXBean = ManagementFactory.getMemoryMXBean();
+        registerMetrics();
+    }
+    
+    private void registerMetrics() {
+        // 注册内存使用率指标
+        Gauge.builder("jvm.memory.heap.used.ratio")
+            .description("堆内存使用率")
+            .register(meterRegistry, this, MemoryMonitor::getHeapUsedRatio);
+            
+        // 注册GC指标
+        ManagementFactory.getGarbageCollectorMXBeans()
+            .forEach(gcBean -> {
+                Gauge.builder("jvm.gc.collection.count")
+                    .tag("gc", gcBean.getName())
+                    .register(meterRegistry, gcBean, GarbageCollectorMXBean::getCollectionCount);
+                    
+                Gauge.builder("jvm.gc.collection.time")
+                    .tag("gc", gcBean.getName())
+                    .register(meterRegistry, gcBean, GarbageCollectorMXBean::getCollectionTime);
+            });
+    }
+    
+    private double getHeapUsedRatio() {
+        MemoryUsage heapUsage = memoryMXBean.getHeapMemoryUsage();
+        return (double) heapUsage.getUsed() / heapUsage.getMax();
+    }
+    
+    // 内存告警
+    @Scheduled(fixedRate = 30000)  // 30秒检查一次
+    public void checkMemoryUsage() {
+        double heapUsedRatio = getHeapUsedRatio();
+        
+        if (heapUsedRatio > 0.85) {
+            log.warn("堆内存使用率过高: {:.2f}%", heapUsedRatio * 100);
+            // 发送告警
+            alertService.sendAlert("高内存使用率告警", 
+                String.format("当前堆内存使用率: %.2f%%", heapUsedRatio * 100));
+        }
+    }
+}
+```
+
+**优化效果：**
+- 内存使用：从峰值60G降低到8G
+- 处理速度：提升60%（并行处理）
+- 稳定性：零OOM异常
+- GC停顿：平均150ms
+
+#### 1.4.4 实战案例三：微服务容器化JVM调优
+
+**问题背景：**
+某微服务在Kubernetes环境中运行，容器经常因为内存限制被kill（OOMKilled）。
+
+**容器配置：**
+```yaml
+# Pod资源配置
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "1"
+  limits:
+    memory: "4Gi"
+    cpu: "2"
+```
+
+**问题分析：**
+```bash
+# 查看容器被kill的原因
+kubectl describe pod app-pod-xxx
+
+# 显示：
+# State: Terminated
+# Reason: OOMKilled
+# Exit Code: 137
+```
+
+**容器内存使用分析：**
+```bash
+# 容器内查看内存使用
+cat /proc/meminfo
+# 发现JVM堆内存只占用1.5G，但总内存使用接近4G
+
+# 分析内存构成：
+# JVM堆内存：1.5G
+# JVM非堆内存：800M（元空间、代码缓存等）
+# 直接内存：600M（NIO、Netty等使用）
+# 操作系统缓存：500M
+# 其他：600M
+```
+
+**根本原因：**
+1. JVM堆内存设置不当，没有考虑容器内存限制
+2. 非堆内存（元空间、直接内存）占用过多
+3. 没有限制直接内存使用
+
+**优化方案：**
+
+1. **容器感知的JVM配置**
+```bash
+# 容器环境下的JVM配置
+# 使用容器感知的内存设置
+-XX:+UseContainerSupport          # 启用容器支持
+-XX:MaxRAMPercentage=75.0         # 使用75%的容器内存作为堆内存
+-XX:InitialRAMPercentage=50.0     # 初始堆内存为50%
+
+# 或者明确指定内存大小
+-Xms2g -Xmx3g                     # 为系统和其他组件预留1G内存
+
+# 限制非堆内存
+-XX:MetaspaceSize=256m
+-XX:MaxMetaspaceSize=512m
+-XX:MaxDirectMemorySize=512m
+-XX:ReservedCodeCacheSize=128m
+
+# G1收集器配置（适合容器环境）
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=100
+-XX:G1HeapRegionSize=16m
+
+# 容器环境下的GC优化
+-XX:+UnlockExperimentalVMOptions
+-XX:+UseCGroupMemoryLimitForHeap  # 使用cgroup内存限制
+```
+
+2. **内存监控改进**
+```java
+// 容器内存监控
+@Component
+public class ContainerMemoryMonitor {
+    
+    @Value("${spring.application.name}")
+    private String applicationName;
+    
+    private final MeterRegistry meterRegistry;
+    
+    public ContainerMemoryMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        registerContainerMetrics();
+    }
+    
+    private void registerContainerMetrics() {
+        // 监控容器内存使用
+        Gauge.builder("container.memory.usage")
+            .description("容器内存使用量")
+            .register(meterRegistry, this, ContainerMemoryMonitor::getContainerMemoryUsage);
+            
+        // 监控JVM直接内存
+        Gauge.builder("jvm.memory.direct.used")
+            .description("直接内存使用量")
+            .register(meterRegistry, this, ContainerMemoryMonitor::getDirectMemoryUsage);
+    }
+    
+    private double getContainerMemoryUsage() {
+        try {
+            // 读取cgroup内存使用
+            String usageStr = Files.readString(Paths.get("/sys/fs/cgroup/memory/memory.usage_in_bytes"));
+            return Double.parseDouble(usageStr.trim());
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+    
+    private double getDirectMemoryUsage() {
+        try {
+            Class<?> vmClass = Class.forName("sun.misc.VM");
+            Method maxDirectMemoryMethod = vmClass.getMethod("maxDirectMemory");
+            long maxDirectMemory = (Long) maxDirectMemoryMethod.invoke(null);
+            
+            // 通过JMX获取直接内存使用量
+            List<MemoryPoolMXBean> memoryPools = ManagementFactory.getMemoryPoolMXBeans();
+            return memoryPools.stream()
+                .filter(pool -> pool.getName().contains("Direct"))
+                .mapToLong(pool -> pool.getUsage().getUsed())
+                .sum();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+}
+```
+
+3. **优化后的Dockerfile**
+```dockerfile
+# 多阶段构建，减少镜像大小
+FROM openjdk:11-jre-slim as runtime
+
+# 添加JVM调优脚本
+COPY jvm-opts.sh /opt/
+RUN chmod +x /opt/jvm-opts.sh
+
+# 设置JVM参数
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:+UseG1GC"
+ENV GC_OPTS="-XX:MaxGCPauseMillis=100 -XX:+PrintGCDetails -Xloggc:/var/log/gc.log"
+ENV MEM_OPTS="-XX:MaxDirectMemorySize=512m -XX:MetaspaceSize=256m"
+
+# 应用启动脚本
+COPY app.jar /app/
+CMD ["/opt/jvm-opts.sh"]
+```
+
+4. **JVM启动脚本**
+```bash
+#!/bin/bash
+# jvm-opts.sh - 动态JVM参数配置
+
+# 获取容器内存限制
+CONTAINER_MEMORY=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+CONTAINER_MEMORY_MB=$((CONTAINER_MEMORY / 1024 / 1024))
+
+# 动态计算JVM参数
+if [ $CONTAINER_MEMORY_MB -lt 1024 ]; then
+    # 小于1G内存的容器
+    HEAP_SIZE="512m"
+    NEW_SIZE="256m"
+elif [ $CONTAINER_MEMORY_MB -lt 2048 ]; then
+    # 1-2G内存的容器
+    HEAP_SIZE="1g"
+    NEW_SIZE="512m"
+else
+    # 大于2G内存的容器
+    HEAP_PERCENT=75
+    HEAP_SIZE="${HEAP_PERCENT}%"
+fi
+
+# 组装JVM参数
+JVM_ARGS="
+-Xms${HEAP_SIZE}
+-Xmx${HEAP_SIZE}
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=100
+-XX:+UseContainerSupport
+-XX:MaxDirectMemorySize=256m
+-XX:MetaspaceSize=128m
+-XX:MaxMetaspaceSize=256m
+-XX:+PrintGCDetails
+-XX:+PrintGCTimeStamps
+-Xloggc:/var/log/gc-%t.log
+-XX:+UseGCLogFileRotation
+-XX:NumberOfGCLogFiles=5
+-XX:GCLogFileSize=10M
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/heapdump/
+"
+
+echo "Container Memory: ${CONTAINER_MEMORY_MB}MB"
+echo "JVM Args: $JVM_ARGS"
+
+# 启动应用
+exec java $JVM_ARGS -jar /app/app.jar
+```
+
+**优化效果：**
+- 容器稳定性：零OOMKilled事件
+- 内存使用率：从95%降低到75%
+- GC停顿时间：平均80ms
+- 启动时间：减少20%
+
+#### 1.4.5 JVM调优最佳实践总结
+
+**1. 调优流程**
+```
+问题发现 → 现状分析 → 根因定位 → 方案制定 → 实施验证 → 持续监控
+```
+
+**2. 调优工具箱**
+```bash
+# 监控工具
+jps          # 查看Java进程
+jstat        # 查看GC统计信息
+jmap         # 生成堆转储
+jstack       # 生成线程转储
+jinfo        # 查看和修改JVM参数
+
+# 分析工具
+MAT          # 内存分析工具
+GCViewer     # GC日志分析
+Arthas       # 在线诊断工具
+JProfiler    # 性能分析工具
+```
+
+**3. 通用调优原则**
+- **内存配置**：堆内存设置为系统内存的70-80%
+- **GC选择**：低延迟场景选G1/ZGC，高吞吐选Parallel
+- **监控告警**：建立完善的监控体系
+- **分步优化**：一次只调整一个参数
+- **压测验证**：充分的压力测试验证效果
+
+**4. 不同场景的推荐配置**
+
+```bash
+# Web应用（低延迟优先）
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=100
+-XX:G1HeapRegionSize=16m
+
+# 批处理应用（高吞吐优先）
+-XX:+UseParallelGC
+-XX:ParallelGCThreads=8
+-XX:+UseParallelOldGC
+
+# 微服务（资源受限）
+-XX:+UseContainerSupport
+-XX:MaxRAMPercentage=75.0
+-XX:+UseG1GC
+
+# 大数据处理（大内存）
+-XX:+UseG1GC
+-XX:G1HeapRegionSize=32m
+-XX:+UseLargePages
+```
+
 ## 2. 并发编程
 
 ### 2.1 线程基础
-**Q: 线程的生命周期状态？**
-- NEW：创建但未启动
-- RUNNABLE：可运行状态（包含运行中和就绪）
-- BLOCKED：阻塞等待锁
-- WAITING：无限期等待
-- TIMED_WAITING：有时限等待
-- TERMINATED：终止
+**Q: 线程的生命周期状态及其转换？**
+
+#### Java线程状态详解
+
+**线程状态枚举（Thread.State）：**
+- **NEW**：创建但未启动
+- **RUNNABLE**：可运行状态（包含运行中和就绪）
+- **BLOCKED**：阻塞等待锁
+- **WAITING**：无限期等待
+- **TIMED_WAITING**：有时限等待
+- **TERMINATED**：终止
+
+#### 线程状态转换详细分析
+
+```java
+// 线程状态转换演示代码
+public class ThreadStateDemo {
+    
+    private static final Object lock = new Object();
+    
+    public static void main(String[] args) throws InterruptedException {
+        
+        // 1. NEW状态：线程创建但未启动
+        Thread thread1 = new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "Thread-1");
+        
+        System.out.println("1. 线程创建后状态: " + thread1.getState()); // NEW
+        
+        // 2. NEW → RUNNABLE：调用start()方法
+        thread1.start();
+        System.out.println("2. 调用start()后状态: " + thread1.getState()); // RUNNABLE
+        
+        // 3. 演示BLOCKED状态
+        Thread thread2 = new Thread(() -> {
+            synchronized (lock) {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "Thread-2");
+        
+        Thread thread3 = new Thread(() -> {
+            synchronized (lock) { // 等待thread2释放锁
+                System.out.println("Thread-3获得锁");
+            }
+        }, "Thread-3");
+        
+        thread2.start();
+        Thread.sleep(100); // 确保thread2先获得锁
+        thread3.start();
+        Thread.sleep(100);
+        
+        System.out.println("3. Thread-3等待锁状态: " + thread3.getState()); // BLOCKED
+        
+        // 4. 演示WAITING状态
+        Thread thread4 = new Thread(() -> {
+            synchronized (lock) {
+                try {
+                    lock.wait(); // 无限期等待
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "Thread-4");
+        
+        thread4.start();
+        Thread.sleep(100);
+        System.out.println("4. Thread-4等待状态: " + thread4.getState()); // WAITING
+        
+        // 5. 演示TIMED_WAITING状态
+        Thread thread5 = new Thread(() -> {
+            try {
+                Thread.sleep(5000); // 有时限等待
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "Thread-5");
+        
+        thread5.start();
+        Thread.sleep(100);
+        System.out.println("5. Thread-5定时等待状态: " + thread5.getState()); // TIMED_WAITING
+        
+        // 6. 等待所有线程结束，演示TERMINATED状态
+        thread1.join();
+        System.out.println("6. Thread-1结束后状态: " + thread1.getState()); // TERMINATED
+        
+        // 唤醒thread4
+        synchronized (lock) {
+            lock.notify();
+        }
+        
+        // 等待其他线程结束
+        thread2.join();
+        thread3.join();
+        thread4.join();
+        thread5.join();
+    }
+}
+```
+
+#### 线程状态转换图解
+
+```
+简单的线程状态转换流程：
+
+1. NEW（新建）
+   ↓ [调用start()方法]
+   
+2. RUNNABLE（可运行）
+   ↓ [根据不同情况转换到以下状态之一]
+   
+3a. BLOCKED（阻塞）        3b. WAITING（等待）        3c. TIMED_WAITING（限时等待）
+    等待获取锁                 无限期等待                   有时间限制的等待
+    ↓ [获得锁]                 ↓ [被唤醒]                   ↓ [超时或被唤醒]
+    
+4. 返回到 RUNNABLE（可运行）
+   ↓ [线程执行完毕]
+   
+5. TERMINATED（终止）
+```
+
+**状态转换触发条件：**
+- NEW → RUNNABLE：调用 `start()` 方法
+- RUNNABLE → BLOCKED：等待获取 synchronized 锁
+- RUNNABLE → WAITING：调用 `wait()`、`join()` 等方法
+- RUNNABLE → TIMED_WAITING：调用 `sleep()`、`wait(timeout)` 等方法
+- BLOCKED/WAITING/TIMED_WAITING → RUNNABLE：获得锁、被唤醒、超时等
+- RUNNABLE → TERMINATED：线程执行完毕或异常终止
+
+#### 各状态转换的具体触发条件
+
+**1. NEW → RUNNABLE**
+```java
+Thread thread = new Thread(() -> {
+    // 线程体
+});
+thread.start(); // 触发状态转换
+```
+
+**2. RUNNABLE → BLOCKED**
+```java
+// 线程尝试获取已被其他线程持有的synchronized锁
+public synchronized void method() {
+    // 如果锁被其他线程持有，当前线程进入BLOCKED状态
+}
+
+// 或者
+synchronized(object) {
+    // 同样的情况
+}
+```
+
+**3. RUNNABLE → WAITING**
+```java
+// 以下操作会使线程进入WAITING状态：
+
+// 1. Object.wait()（不带超时参数）
+synchronized(obj) {
+    obj.wait(); // 进入WAITING状态
+}
+
+// 2. Thread.join()（不带超时参数）
+otherThread.join(); // 等待otherThread结束
+
+// 3. LockSupport.park()
+LockSupport.park(); // 线程暂停
+```
+
+**4. RUNNABLE → TIMED_WAITING**
+```java
+// 以下操作会使线程进入TIMED_WAITING状态：
+
+// 1. Thread.sleep(long millis)
+Thread.sleep(1000); // 休眠1秒
+
+// 2. Object.wait(long timeout)
+synchronized(obj) {
+    obj.wait(1000); // 最多等待1秒
+}
+
+// 3. Thread.join(long millis)
+otherThread.join(1000); // 最多等待1秒
+
+// 4. LockSupport.parkNanos(long nanos)
+LockSupport.parkNanos(1000000000L); // 暂停1秒
+
+// 5. LockSupport.parkUntil(long deadline)
+LockSupport.parkUntil(System.currentTimeMillis() + 1000);
+```
+
+**5. BLOCKED/WAITING/TIMED_WAITING → RUNNABLE**
+```java
+// 从BLOCKED到RUNNABLE
+// 当线程获得锁时自动转换
+
+// 从WAITING到RUNNABLE
+synchronized(obj) {
+    obj.notify();     // 唤醒一个等待线程
+    obj.notifyAll();  // 唤醒所有等待线程
+}
+LockSupport.unpark(thread); // 唤醒被park的线程
+
+// 从TIMED_WAITING到RUNNABLE
+// 1. 超时自动唤醒
+// 2. 被interrupt()中断
+// 3. 被notify()/notifyAll()唤醒（如果是wait(timeout)）
+// 4. 被unpark()唤醒（如果是parkNanos/parkUntil）
+```
+
+**6. RUNNABLE → TERMINATED**
+```java
+// 线程正常执行完毕
+public void run() {
+    // 执行线程任务
+    return; // 线程结束，进入TERMINATED状态
+}
+
+// 线程因未捕获异常而终止
+public void run() {
+    throw new RuntimeException("异常"); // 线程异常终止
+}
+```
+
+#### 实际应用中的状态监控
+
+```java
+// 线程状态监控工具类
+public class ThreadStateMonitor {
+    
+    public static void monitorThreadState(Thread thread, String threadName) {
+        Thread monitor = new Thread(() -> {
+            while (thread.isAlive()) {
+                Thread.State state = thread.getState();
+                System.out.printf("[%s] %s 当前状态: %s%n", 
+                    LocalTime.now(), threadName, state);
+                
+                try {
+                    Thread.sleep(500); // 每500ms检查一次
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            System.out.printf("[%s] %s 最终状态: %s%n", 
+                LocalTime.now(), threadName, thread.getState());
+        });
+        
+        monitor.setDaemon(true);
+        monitor.start();
+    }
+    
+    // 获取线程详细信息
+    public static void printThreadInfo(Thread thread) {
+        System.out.println("===== 线程信息 =====");
+        System.out.println("线程名称: " + thread.getName());
+        System.out.println("线程ID: " + thread.getId());
+        System.out.println("线程状态: " + thread.getState());
+        System.out.println("是否存活: " + thread.isAlive());
+        System.out.println("是否守护线程: " + thread.isDaemon());
+        System.out.println("线程优先级: " + thread.getPriority());
+        System.out.println("所属线程组: " + thread.getThreadGroup().getName());
+        System.out.println("是否被中断: " + thread.isInterrupted());
+    }
+}
+```
+
+#### 线程状态转换的常见问题
+
+**1. 为什么没有RUNNING状态？**
+```java
+// Java的RUNNABLE状态包含了操作系统层面的READY和RUNNING两种状态
+// 这是因为JVM无法精确知道线程在操作系统层面的确切状态
+public class RunnableStateExplanation {
+    /*
+     * RUNNABLE状态表示：
+     * 1. 线程正在JVM中执行（对应OS的RUNNING）
+     * 2. 线程等待操作系统分配CPU时间（对应OS的READY）
+     * 3. 线程可能在等待操作系统资源，如I/O（仍然是RUNNABLE）
+     */
+}
+```
+
+**2. BLOCKED vs WAITING vs TIMED_WAITING 的区别**
+```java
+public class StateComparison {
+    
+    // BLOCKED：等待获取锁
+    public void demonstrateBlocked() {
+        Object lock = new Object();
+        
+        // 线程1获得锁
+        new Thread(() -> {
+            synchronized (lock) {
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }).start();
+        
+        // 线程2等待锁 - 进入BLOCKED状态
+        new Thread(() -> {
+            synchronized (lock) { // 在这里等待锁
+                System.out.println("获得锁");
+            }
+        }).start();
+    }
+    
+    // WAITING：主动等待唤醒
+    public void demonstrateWaiting() {
+        Object lock = new Object();
+        
+        new Thread(() -> {
+            synchronized (lock) {
+                try {
+                    lock.wait(); // 主动进入WAITING状态
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }).start();
+    }
+    
+    // TIMED_WAITING：有时限的等待
+    public void demonstrateTimedWaiting() {
+        new Thread(() -> {
+            try {
+                Thread.sleep(1000); // 进入TIMED_WAITING状态
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }).start();
+    }
+}
+```
+
+**3. 中断对线程状态的影响**
+```java
+public class InterruptImpact {
+    
+    public void demonstrateInterrupt() {
+        Thread sleepingThread = new Thread(() -> {
+            try {
+                System.out.println("线程开始休眠，状态: " + Thread.currentThread().getState());
+                Thread.sleep(10000); // TIMED_WAITING状态
+            } catch (InterruptedException e) {
+                System.out.println("线程被中断，状态: " + Thread.currentThread().getState());
+                Thread.currentThread().interrupt(); // 重新设置中断标志
+                return;
+            }
+        });
+        
+        sleepingThread.start();
+        
+        // 2秒后中断线程
+        try {
+            Thread.sleep(2000);
+            System.out.println("中断前线程状态: " + sleepingThread.getState());
+            sleepingThread.interrupt(); // 中断休眠线程
+            Thread.sleep(100);
+            System.out.println("中断后线程状态: " + sleepingThread.getState());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+#### 线程状态转换的性能考虑
+
+```java
+// 线程状态转换的开销分析
+public class StateTransitionPerformance {
+    
+    // 频繁的状态转换会影响性能
+    public void demonstratePerformanceImpact() {
+        long startTime = System.nanoTime();
+        
+        // 避免这样的代码：频繁的短时间sleep
+        for (int i = 0; i < 1000; i++) {
+            try {
+                Thread.sleep(1); // 频繁的RUNNABLE → TIMED_WAITING → RUNNABLE
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        
+        long endTime = System.nanoTime();
+        System.out.println("频繁状态转换耗时: " + (endTime - startTime) / 1000000 + "ms");
+        
+        // 更好的做法：减少状态转换
+        startTime = System.nanoTime();
+        try {
+            Thread.sleep(1000); // 一次较长的sleep
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        endTime = System.nanoTime();
+        System.out.println("单次状态转换耗时: " + (endTime - startTime) / 1000000 + "ms");
+    }
+}
+```
+
+#### 总结：线程状态转换最佳实践
+
+1. **理解状态含义**：准确理解每种状态的含义和触发条件
+2. **避免频繁转换**：减少不必要的状态转换以提高性能
+3. **正确处理中断**：在可中断的操作中正确处理InterruptedException
+4. **使用高级并发工具**：优先使用java.util.concurrent包中的工具类
+5. **监控线程状态**：在调试时使用线程状态监控来诊断问题
 
 **Q: synchronized和volatile的区别？**
 - synchronized：保证原子性、可见性、有序性
@@ -688,6 +1705,190 @@ ThreadPoolExecutor(
     RejectedExecutionHandler handler    // 拒绝策略
 )
 ```
+
+#### 线程池状态详解
+
+**线程池生命周期状态：**
+
+```java
+// ThreadPoolExecutor的内部状态定义
+public class ThreadPoolExecutor extends AbstractExecutorService {
+    
+    // 线程池状态常量（使用AtomicInteger的高位存储）
+    private static final int RUNNING    = -1 << COUNT_BITS;  // 运行状态
+    private static final int SHUTDOWN   =  0 << COUNT_BITS;  // 关闭状态
+    private static final int STOP       =  1 << COUNT_BITS;  // 停止状态
+    private static final int TIDYING    =  2 << COUNT_BITS;  // 整理状态
+    private static final int TERMINATED =  3 << COUNT_BITS;  // 终止状态
+    
+    // 状态和线程数量的复合字段
+    private final AtomicInteger ctl = new AtomicInteger(ctlOf(RUNNING, 0));
+}
+```
+
+#### 线程池状态转换图
+
+```
+线程池状态转换流程：
+
+1. RUNNING（运行）
+   - 接受新任务，处理队列中的任务
+   ↓ [shutdown()方法]
+   
+2. SHUTDOWN（关闭）
+   - 不接受新任务，但处理队列中的任务
+   ↓ [shutdownNow()方法 或 队列为空且线程为0]
+   
+3. STOP（停止）
+   - 不接受新任务，不处理队列任务，中断正在执行的任务
+   ↓ [所有线程终止]
+   
+4. TIDYING（整理）
+   - 所有任务已终止，线程池中的线程数为0
+   ↓ [terminated()方法执行完毕]
+   
+5. TERMINATED（终止）
+   - terminated()方法执行完毕
+```
+
+#### 线程池状态转换详细分析
+
+**1. RUNNING → SHUTDOWN**
+```java
+public class ThreadPoolStateDemo {
+    
+    public void demonstrateShutdown() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+            2, 4, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(10)
+        );
+        
+        // 线程池初始状态为RUNNING
+        System.out.println("初始状态: " + getPoolState(executor));
+        
+        // 提交一些任务
+        for (int i = 0; i < 5; i++) {
+            final int taskId = i;
+            executor.submit(() -> {
+                try {
+                    Thread.sleep(2000);
+                    System.out.println("任务 " + taskId + " 完成");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.out.println("任务 " + taskId + " 被中断");
+                }
+            });
+        }
+        
+        // 调用shutdown()，状态变为SHUTDOWN
+        executor.shutdown();
+        System.out.println("shutdown后状态: " + getPoolState(executor));
+        
+        // shutdown后仍会处理队列中的任务
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                System.out.println("等待超时，强制关闭");
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        
+        System.out.println("最终状态: " + getPoolState(executor));
+    }
+    
+    // 获取线程池状态的工具方法
+    private String getPoolState(ThreadPoolExecutor executor) {
+        if (executor.isTerminated()) {
+            return "TERMINATED";
+        } else if (executor.isTerminating()) {
+            return "TIDYING";
+        } else if (executor.isShutdown()) {
+            return "SHUTDOWN";
+        } else {
+            return "RUNNING";
+        }
+    }
+}
+```
+```
+
+**2. RUNNING → STOP**
+```java
+public void demonstrateShutdownNow() {
+    ThreadPoolExecutor executor = new ThreadPoolExecutor(
+        2, 4, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(10)
+    );
+    
+    // 提交一些长时间任务
+    for (int i = 0; i < 5; i++) {
+        final int taskId = i;
+        executor.submit(() -> {
+            try {
+                Thread.sleep(10000); // 模拟长时间任务
+                System.out.println("任务 " + taskId + " 完成");
+            } catch (InterruptedException e) {
+                System.out.println("任务 " + taskId + " 被中断");
+                Thread.currentThread().interrupt();
+            }
+        });
+    }
+    
+    Thread.sleep(1000); // 让任务开始执行
+    
+    // 调用shutdownNow()，状态直接变为STOP
+    List<Runnable> pendingTasks = executor.shutdownNow();
+    System.out.println("被取消的任务数量: " + pendingTasks.size());
+    System.out.println("shutdownNow后状态: " + getPoolState(executor));
+}
+```
+
+#### 线程池状态监控和最佳实践
+
+```java
+// 线程池状态监控工具类
+public class ThreadPoolMonitor {
+    
+    public void monitorThreadPoolState(ThreadPoolExecutor executor, String poolName) {
+        ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor();
+        
+        monitor.scheduleAtFixedRate(() -> {
+            System.out.printf("[%s] %s 线程池状态:%n", LocalTime.now(), poolName);
+            System.out.printf("状态: %s%n", getDetailedPoolState(executor));
+            System.out.printf("核心线程数: %d%n", executor.getCorePoolSize());
+            System.out.printf("当前线程数: %d%n", executor.getPoolSize());
+            System.out.printf("活跃线程数: %d%n", executor.getActiveCount());
+            System.out.printf("队列任务数: %d%n", executor.getQueue().size());
+            System.out.println("-".repeat(50));
+            
+            if (executor.isTerminated()) {
+                monitor.shutdown();
+            }
+        }, 0, 2, TimeUnit.SECONDS);
+    }
+    
+    private String getDetailedPoolState(ThreadPoolExecutor executor) {
+        if (executor.isTerminated()) {
+            return "TERMINATED - 线程池已完全终止";
+        } else if (executor.isTerminating()) {
+            return "TIDYING - 正在整理和终止";
+        } else if (executor.isShutdown()) {
+            return "SHUTDOWN - 不接受新任务，处理剩余任务";
+        } else {
+            return "RUNNING - 正常运行";
+        }
+    }
+}
+```
+
+**线程池状态管理最佳实践：**
+1. **始终检查线程池状态**：在提交任务前检查是否为RUNNING状态
+2. **合理设置关闭超时时间**：给予足够时间完成正在执行的任务
+3. **正确处理被拒绝的任务**：选择合适的拒绝策略
+4. **实时监控线程池健康状态**：监控线程数、队列长度等指标
+5. **优雅关闭线程池**：在应用关闭时避免数据丢失和资源泄漏
 
 **Q: 常见的阻塞队列？**
 - ArrayBlockingQueue：有界数组队列
@@ -893,6 +2094,445 @@ public class SimpleIOCContainer {
 - **普通索引**：提高查询效率
 - **组合索引**：多列组合，注意最左前缀原则
 - **覆盖索引**：索引包含所需字段，避免回表
+
+#### MySQL优化实战案例
+
+#### 案例一：电商订单系统慢查询优化
+
+**问题背景：**
+某电商平台的订单查询接口响应时间从原来的100ms增加到5秒以上，严重影响用户体验。
+
+**问题SQL：**
+```sql
+-- 原始问题SQL
+SELECT o.order_id, o.order_amount, o.created_time, 
+       u.username, u.phone, 
+       p.product_name, p.price
+FROM orders o 
+JOIN users u ON o.user_id = u.user_id 
+JOIN order_items oi ON o.order_id = oi.order_id 
+JOIN products p ON oi.product_id = p.product_id 
+WHERE o.created_time >= '2023-01-01' 
+AND o.status = 'completed' 
+AND u.city = '北京' 
+ORDER BY o.created_time DESC 
+LIMIT 20;
+```
+
+**问题分析：**
+```sql
+-- 查看执行计划
+EXPLAIN FORMAT=JSON SELECT ...;
+
+-- 执行计划显示问题：
+-- 1. orders表全表扫描（500万条记录）
+-- 2. users表根据city字段过滤时没有使用索引
+-- 3. JOIN操作使用了临时表和文件排序
+-- 4. 最终扫描了数百万行数据才返回20条结果
+```
+
+**优化方案：**
+
+**1. 索引优化**
+```sql
+-- 创建复合索引
+CREATE INDEX idx_orders_time_status ON orders(created_time, status);
+CREATE INDEX idx_users_city ON users(city);
+CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+CREATE INDEX idx_products_id ON products(product_id);
+
+-- 创建覆盖索引（避免回表）
+CREATE INDEX idx_orders_covering ON orders(created_time, status, order_id, user_id, order_amount);
+```
+
+**2. SQL重写优化**
+```sql
+-- 优化后的SQL
+SELECT o.order_id, o.order_amount, o.created_time, 
+       u.username, u.phone, 
+       p.product_name, p.price
+FROM (
+    -- 先通过索引快速定位订单
+    SELECT order_id, user_id, order_amount, created_time
+    FROM orders 
+    WHERE created_time >= '2023-01-01' 
+    AND status = 'completed'
+    ORDER BY created_time DESC 
+    LIMIT 20
+) o
+JOIN users u ON o.user_id = u.user_id AND u.city = '北京'
+JOIN order_items oi ON o.order_id = oi.order_id 
+JOIN products p ON oi.product_id = p.product_id;
+```
+
+**3. 进一步优化 - 分页查询**
+```sql
+-- 使用游标分页替代OFFSET
+-- 第一页
+SELECT * FROM (
+    SELECT o.order_id, o.order_amount, o.created_time, 
+           u.username, u.phone
+    FROM orders o 
+    JOIN users u ON o.user_id = u.user_id 
+    WHERE o.created_time >= '2023-01-01' 
+    AND o.status = 'completed'
+    AND u.city = '北京'
+    ORDER BY o.created_time DESC 
+    LIMIT 20
+) result;
+
+-- 后续页（基于上一页最后一条记录的时间）
+SELECT * FROM (
+    SELECT o.order_id, o.order_amount, o.created_time, 
+           u.username, u.phone
+    FROM orders o 
+    JOIN users u ON o.user_id = u.user_id 
+    WHERE o.created_time >= '2023-01-01' 
+    AND o.created_time < '2023-10-15 10:30:45'  -- 上一页最后一条记录的时间
+    AND o.status = 'completed'
+    AND u.city = '北京'
+    ORDER BY o.created_time DESC 
+    LIMIT 20
+) result;
+```
+
+**优化效果：**
+- 查询时间：从5秒降低到50ms
+- 扫描行数：从500万行降低到100行
+- CPU使用率：降低70%
+- 并发能力：提升10倍
+
+#### 案例二：用户画像系统索引设计优化
+
+**业务场景：**
+用户画像系统需要根据多个维度快速筛选用户，包括年龄、性别、地区、兴趣标签等。
+
+**原始表结构：**
+```sql
+CREATE TABLE user_profiles (
+    user_id BIGINT PRIMARY KEY,
+    age INT,
+    gender TINYINT,  -- 1:男 2:女
+    province VARCHAR(20),
+    city VARCHAR(50),
+    interests TEXT,  -- 兴趣标签，逗号分隔
+    last_login_time DATETIME,
+    register_time DATETIME,
+    user_level TINYINT,  -- 用户等级
+    INDEX idx_age (age),
+    INDEX idx_city (city)
+);
+```
+
+**常见查询场景：**
+```sql
+-- 场景1：根据年龄和性别筛选
+SELECT COUNT(*) FROM user_profiles 
+WHERE age BETWEEN 25 AND 35 AND gender = 1;
+
+-- 场景2：根据地区和用户等级筛选
+SELECT user_id FROM user_profiles 
+WHERE province = '北京' AND user_level >= 3 
+ORDER BY last_login_time DESC LIMIT 100;
+
+-- 场景3：根据兴趣标签筛选
+SELECT user_id FROM user_profiles 
+WHERE interests LIKE '%游戏%' AND age BETWEEN 18 AND 30;
+```
+
+**问题分析：**
+1. 复合查询条件无法有效使用索引
+2. TEXT字段的LIKE查询性能极差
+3. 多维度组合查询导致索引失效
+
+**优化方案：**
+
+**1. 重新设计表结构**
+```sql
+-- 主表优化
+CREATE TABLE user_profiles_optimized (
+    user_id BIGINT PRIMARY KEY,
+    age TINYINT,  -- 年龄范围编码：1(18-25), 2(26-35), 3(36-45), etc.
+    gender TINYINT,
+    province_code SMALLINT,  -- 省份编码
+    city_code INT,           -- 城市编码
+    last_login_time DATETIME,
+    register_time DATETIME,
+    user_level TINYINT,
+    -- 复合索引设计
+    INDEX idx_age_gender (age, gender),
+    INDEX idx_province_level (province_code, user_level, last_login_time),
+    INDEX idx_city_age (city_code, age),
+    INDEX idx_login_time (last_login_time)
+);
+
+-- 兴趣标签单独表
+CREATE TABLE user_interests (
+    user_id BIGINT,
+    interest_id INT,  -- 兴趣标签ID
+    weight DECIMAL(3,2) DEFAULT 1.0,  -- 兴趣权重
+    PRIMARY KEY (user_id, interest_id),
+    INDEX idx_interest_user (interest_id, user_id)
+);
+
+-- 兴趣标签字典表
+CREATE TABLE interest_dict (
+    interest_id INT PRIMARY KEY,
+    interest_name VARCHAR(50),
+    category VARCHAR(20)
+);
+```
+
+**2. 优化后的查询**
+```sql
+-- 优化场景1：年龄性别查询
+SELECT COUNT(*) FROM user_profiles_optimized 
+WHERE age IN (2, 3) AND gender = 1;  -- 使用复合索引
+
+-- 优化场景2：地区等级查询
+SELECT user_id FROM user_profiles_optimized 
+WHERE province_code = 110000 AND user_level >= 3 
+ORDER BY last_login_time DESC LIMIT 100;
+
+-- 优化场景3：兴趣标签查询
+SELECT up.user_id 
+FROM user_profiles_optimized up
+JOIN user_interests ui ON up.user_id = ui.user_id
+JOIN interest_dict id ON ui.interest_id = id.interest_id
+WHERE id.interest_name = '游戏' 
+AND up.age IN (1, 2);  -- 18-35岁
+```
+
+**3. 分区表优化**
+```sql
+-- 按注册时间分区
+CREATE TABLE user_profiles_partitioned (
+    -- 字段定义同上
+) PARTITION BY RANGE (YEAR(register_time)) (
+    PARTITION p2020 VALUES LESS THAN (2021),
+    PARTITION p2021 VALUES LESS THAN (2022),
+    PARTITION p2022 VALUES LESS THAN (2023),
+    PARTITION p2023 VALUES LESS THAN (2024),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+#### 案例三：高并发秒杀系统数据库优化
+
+**业务场景：**
+电商秒杀活动，1000个商品，100万用户同时抢购，要求系统能够承受高并发访问。
+
+**原始方案问题：**
+```sql
+-- 原始的秒杀扣减库存SQL
+UPDATE products 
+SET stock = stock - 1 
+WHERE product_id = 12345 AND stock > 0;
+
+-- 问题：
+-- 1. 高并发下行锁竞争激烈
+-- 2. 大量UPDATE操作导致锁等待
+-- 3. 数据库成为性能瓶颈
+```
+
+**数据库层面优化方案：**
+
+**1. 表结构优化**
+```sql
+-- 秒杀商品表
+CREATE TABLE seckill_products (
+    product_id BIGINT PRIMARY KEY,
+    total_stock INT NOT NULL,
+    current_stock INT NOT NULL,
+    start_time DATETIME NOT NULL,
+    end_time DATETIME NOT NULL,
+    version INT DEFAULT 0,  -- 乐观锁版本号
+    INDEX idx_time (start_time, end_time)
+) ENGINE=InnoDB;
+
+-- 秒杀订单表（分库分表）
+CREATE TABLE seckill_orders_0 (
+    order_id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    order_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TINYINT DEFAULT 1,  -- 1:待支付 2:已支付 3:已取消
+    INDEX idx_user_product (user_id, product_id),
+    INDEX idx_product_time (product_id, order_time)
+) ENGINE=InnoDB;
+
+-- 创建多个分表
+CREATE TABLE seckill_orders_1 LIKE seckill_orders_0;
+CREATE TABLE seckill_orders_2 LIKE seckill_orders_0;
+-- ... 创建更多分表
+```
+
+**2. 乐观锁实现**
+```java
+// Java代码实现乐观锁
+@Service
+public class SeckillService {
+    
+    @Autowired
+    private SeckillProductMapper seckillProductMapper;
+    
+    @Transactional
+    public boolean seckillProduct(Long productId, Long userId) {
+        
+        // 1. 查询商品信息（包含版本号）
+        SeckillProduct product = seckillProductMapper.selectByIdWithVersion(productId);
+        
+        if (product == null || product.getCurrentStock() <= 0) {
+            return false;
+        }
+        
+        // 2. 使用乐观锁更新库存
+        int updateCount = seckillProductMapper.updateStockWithVersion(
+            productId, product.getVersion());
+        
+        if (updateCount == 0) {
+            // 更新失败，说明版本号已变化（其他事务已修改）
+            return false;
+        }
+        
+        // 3. 创建订单（插入到分表）
+        createSeckillOrder(productId, userId);
+        
+        return true;
+    }
+}
+```
+
+```sql
+-- 对应的SQL实现
+-- 查询商品信息
+SELECT product_id, current_stock, version 
+FROM seckill_products 
+WHERE product_id = #{productId};
+
+-- 乐观锁更新库存
+UPDATE seckill_products 
+SET current_stock = current_stock - 1, 
+    version = version + 1 
+WHERE product_id = #{productId} 
+AND version = #{version} 
+AND current_stock > 0;
+```
+
+**3. 预分配库存策略**
+```sql
+-- 库存分配表
+CREATE TABLE stock_allocation (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    product_id BIGINT NOT NULL,
+    batch_no INT NOT NULL,  -- 批次号
+    allocated_stock INT NOT NULL,  -- 分配的库存数量
+    used_stock INT DEFAULT 0,  -- 已使用的库存
+    status TINYINT DEFAULT 1,  -- 1:可用 2:已用完
+    INDEX idx_product_batch (product_id, batch_no)
+) ENGINE=InnoDB;
+
+-- 预先分配库存到不同批次
+INSERT INTO stock_allocation (product_id, batch_no, allocated_stock) VALUES
+(12345, 1, 200),
+(12345, 2, 200),
+(12345, 3, 200),
+(12345, 4, 200),
+(12345, 5, 200);
+
+-- 秒杀时分批次扣减
+UPDATE stock_allocation 
+SET used_stock = used_stock + 1
+WHERE product_id = 12345 
+AND batch_no = #{batchNo}
+AND used_stock < allocated_stock;
+```
+
+**4. 数据库参数优化**
+```sql
+-- MySQL配置优化
+[mysqld]
+# 连接相关
+max_connections = 3000
+max_connect_errors = 1000
+connect_timeout = 10
+
+# InnoDB优化
+innodb_buffer_pool_size = 8G  # 设置为内存的70-80%
+innodb_log_file_size = 1G
+innodb_log_buffer_size = 32M
+innodb_flush_log_at_trx_commit = 2  # 提高写入性能
+innodb_thread_concurrency = 16
+
+# 查询缓存
+query_cache_size = 256M
+query_cache_type = 1
+
+# 临时表优化
+tmp_table_size = 256M
+max_heap_table_size = 256M
+```
+
+**优化效果：**
+- QPS：从1000提升到10000
+- 响应时间：从500ms降低到50ms
+- 数据库CPU使用率：从90%降低到30%
+- 锁等待时间：减少95%
+
+#### MySQL性能监控和诊断
+
+```sql
+-- 慢查询监控
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 0.5;  -- 超过0.5秒记录
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+
+-- 查看当前正在执行的查询
+SELECT 
+    id,
+    user,
+    host,
+    db,
+    command,
+    time,
+    state,
+    LEFT(info, 100) as query_start
+FROM information_schema.processlist 
+WHERE time > 5 AND command != 'Sleep'
+ORDER BY time DESC;
+
+-- 分析表的索引使用情况
+SELECT 
+    table_schema,
+    table_name,
+    index_name,
+    seq_in_index,
+    column_name,
+    cardinality
+FROM information_schema.statistics 
+WHERE table_schema = 'your_database'
+ORDER BY table_name, index_name, seq_in_index;
+
+-- 查看表的存储引擎和大小
+SELECT 
+    table_name,
+    engine,
+    table_rows,
+    ROUND((data_length + index_length) / 1024 / 1024, 2) AS size_mb,
+    ROUND(data_length / 1024 / 1024, 2) AS data_mb,
+    ROUND(index_length / 1024 / 1024, 2) AS index_mb
+FROM information_schema.tables 
+WHERE table_schema = 'your_database'
+ORDER BY (data_length + index_length) DESC;
+```
+
+**MySQL优化最佳实践总结：**
+1. **索引设计**：根据查询模式设计复合索引，遵循最左前缀原则
+2. **查询优化**：避免全表扫描，合理使用LIMIT，避免SELECT *
+3. **表结构优化**：选择合适的数据类型，适当的表分区和分表
+4. **并发控制**：使用乐观锁减少锁竞争，合理设置隔离级别
+5. **配置调优**：根据硬件资源调整MySQL参数
+6. **监控告警**：建立完善的慢查询监控和性能指标监控
 
 ### 5.2 事务机制
 **Q: 事务的ACID特性？**
