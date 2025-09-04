@@ -1,4 +1,4 @@
-# AI 高级面试题完整整理
+# AI 面试基础题整理
 
 ## 📋 目录
 
@@ -6,16 +6,17 @@
   - [1.1 监督学习](#11-监督学习)
   - [1.2 无监督学习](#12-无监督学习)
   - [1.3 强化学习](#13-强化学习)
-  - [1.4 模型评估与选择](#14-模型评估与选择)
-- [2. 深度学习](#2-深度学习)
-  - [2.1 神经网络基础](#21-神经网络基础)
+  - [1.4 模型评估](#14-模型评估)
+- [2. 深度学习基础](#2-深度学习基础)
+  - [2.1 神经网络](#21-神经网络)
   - [2.2 卷积神经网络](#22-卷积神经网络)
   - [2.3 循环神经网络](#23-循环神经网络)
-  - [2.4 Transformer架构](#24-transformer架构)
+  - [2.4 Transformer](#24-transformer)
 - [3. 自然语言处理](#3-自然语言处理)
 - [4. 计算机视觉](#4-计算机视觉)
-- [5. 大模型与LLM](#5-大模型与llm)
-- [6. AI工程实践](#6-ai工程实践)
+- [5. 大模型基础](#5-大模型基础)
+- [6. 多模态生成模型](#6-多模态生成模型)
+- [7. 实际应用](#7-实际应用)
 
 ---
 
@@ -23,514 +24,448 @@
 
 ### 1.1 监督学习
 
-**Q: 解释偏差(Bias)和方差(Variance)的概念，以及它们之间的权衡？**
+**Q: 什么是偏差和方差？**
 
-**理论解析：**
-- **偏差(Bias)**：模型预测值与真实值之间的系统性误差
-- **方差(Variance)**：模型在不同训练集上预测结果的变化程度
-- **权衡关系**：总误差 = 偏差² + 方差 + 噪声
+**简单理解：**
+- **偏差(Bias)**：模型的预测结果与正确结果之间的差距
+- **方差(Variance)**：模型在不同数据上的预测结果的变化程度
+- **权衡关系**：一般来说，偏差高方差低，或者偏差低方差高
 
-**实战代码示例：**
-```python
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import LinearRegression
-from sklearn.pipeline import Pipeline
+**直观例子：**
+- 高偏差：像一个不精准的射手，总是偏离目标
+- 高方差：像一个不稳定的射手，每次都射在不同位置
 
-def bias_variance_analysis():
-    """偏差-方差分析实战演示"""
-    
-    # 生成真实函数数据
-    def true_function(x):
-        return 1.5 * x**2 + 0.3 * x + 0.1
-    
-    # 生成训练数据
-    np.random.seed(42)
-    n_samples = 100
-    X = np.random.uniform(-1, 1, n_samples).reshape(-1, 1)
-    noise = np.random.normal(0, 0.1, n_samples)
-    y = true_function(X.ravel()) + noise
-    
-    # 测试数据
-    X_test = np.linspace(-1.2, 1.2, 100).reshape(-1, 1)
-    y_test_true = true_function(X_test.ravel())
-    
-    # 不同复杂度的模型
-    degrees = [1, 3, 9, 15]
-    n_experiments = 100
-    
-    results = {}
-    
-    for degree in degrees:
-        predictions = []
-        
-        # 多次实验来估计偏差和方差
-        for i in range(n_experiments):
-            # 重新采样训练数据
-            indices = np.random.choice(len(X), size=len(X), replace=True)
-            X_bootstrap = X[indices]
-            y_bootstrap = y[indices]
-            
-            # 训练模型
-            poly_model = Pipeline([
-                ('poly', PolynomialFeatures(degree=degree)),
-                ('linear', LinearRegression())
-            ])
-            
-            poly_model.fit(X_bootstrap, y_bootstrap)
-            pred = poly_model.predict(X_test)
-            predictions.append(pred)
-        
-        predictions = np.array(predictions)
-        
-        # 计算偏差和方差
-        mean_prediction = np.mean(predictions, axis=0)
-        bias_squared = np.mean((mean_prediction - y_test_true)**2)
-        variance = np.mean(np.var(predictions, axis=0))
-        
-        results[degree] = {
-            'bias_squared': bias_squared,
-            'variance': variance,
-            'total_error': bias_squared + variance,
-        }
-        
-        print(f"多项式度数 {degree}:")
-        print(f"  偏差² = {bias_squared:.4f}")
-        print(f"  方差 = {variance:.4f}")
-        print(f"  总误差 = {bias_squared + variance:.4f}")
-        print()
-    
-    return results
+**Q: 什么是过拟合和欠拟合？**
 
-# 运行分析
-results = bias_variance_analysis()
-```
+**简单解释：**
+- **过拟合**：模型在训练数据上表现很好，但在新数据上表现很差
+- **欠拟合**：模型太简单，连训练数据都学不好
 
-**Q: 什么是过拟合和欠拟合？如何检测和解决？**
+**如何识别：**
+- 过拟合：训练准确率高，测试准确率低
+- 欠拟合：训练和测试准确率都低
 
-**检测方法：**
-1. **验证曲线**：观察训练误差和验证误差随参数变化的趋势
-2. **学习曲线**：观察误差随训练样本数量变化的趋势
-3. **交叉验证**：使用K折交叉验证评估模型泛化能力
+**解决方法：**
+- 过拟合：加数据、正则化、早停
+- 欠拟合：增加模型复杂度、加特征
 
-**解决方案：**
-- **过拟合**：正则化、早停、Dropout、数据增强
-- **欠拟合**：增加模型复杂度、特征工程、减少正则化
+**Q: 常见的机器学习算法有哪些？**
+
+**线性模型：**
+- **线性回归**：用直线拟合数据
+- **逻辑回归**：用于分类问题的线性模型
+
+**树模型：**
+- **决策树**：像做选择题一样分支决策
+- **随机森林**：多个决策树投票决定
+
+**其他常用算法：**
+- **SVM**：找到最好的分类边界
+- **朴素贝叶斯**：基于概率的分类方法
+- **KNN**：看最近邻居的标签来决定
 
 ### 1.2 无监督学习
 
-**Q: 解释K-means聚类算法的原理和局限性？**
+**Q: 什么是K-means聚类算法？**
 
-**K-means算法原理：**
-1. 随机初始化K个聚类中心
-2. 将每个点分配到最近的聚类中心
-3. 更新聚类中心为该类所有点的均值
+**简单原理：**
+1. 选择K个初始中心点
+2. 把每个数据点分给最近的中心
+3. 更新中心为该类所有点的平均值
 4. 重复2-3步直到收敛
 
-**局限性：**
-- 需要预先指定K值
-- 对初始化敏感
-- 假设聚类是球形的
-- 对噪声和异常值敏感
+**优缺点：**
+- 优点：简单易懂，速度快
+- 缺点：需要预先指定K值，对初始值敏感
 
-**改进方法：**
-```python
-from sklearn.cluster import KMeans
-import numpy as np
+**Q: 还有哪些常见的无监督学习方法？**
 
-def improved_kmeans():
-    """改进的K-means实现"""
-    
-    # K-means++初始化
-    kmeans_plus = KMeans(n_clusters=3, init='k-means++', n_init=10)
-    
-    # 多次运行选择最佳结果
-    best_inertia = float('inf')
-    best_model = None
-    
-    for _ in range(20):
-        kmeans = KMeans(n_clusters=3, random_state=None)
-        kmeans.fit(X)
-        if kmeans.inertia_ < best_inertia:
-            best_inertia = kmeans.inertia_
-            best_model = kmeans
-    
-    return best_model
-```
+**聚类方法：**
+- **层次聚类**：逐步合并或分割
+- **DBSCAN**：基于密度的聚类，能找到异常点
+
+**降维方法：**
+- **PCA**：主成分分析，找到数据的主要方向
+- **t-SNE**：用于数据可视化
 
 ### 1.3 强化学习
 
-**Q: 解释Q-learning算法的原理？**
+**Q: 什么是强化学习？**
 
-**Q-learning核心公式：**
-```
-Q(s,a) = Q(s,a) + α[r + γ·max(Q(s',a')) - Q(s,a)]
-```
-
-**关键概念：**
+**基本概念：**
+- **智能体(Agent)**：做决策的实体
+- **环境(Environment)**：智能体所在的世界
 - **状态(State)**：环境的当前情况
-- **动作(Action)**：智能体可以采取的行为
-- **奖励(Reward)**：执行动作后获得的反馈
-- **Q值**：在状态s下采取动作a的期望累积奖励
+- **动作(Action)**：智能体可以做的事
+- **奖励(Reward)**：做动作后得到的反馈
 
-**简化实现：**
-```python
-class QLearning:
-    def __init__(self, actions, lr=0.1, gamma=0.9, epsilon=0.1):
-        self.actions = actions
-        self.lr = lr
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.q_table = {}
-    
-    def get_q_value(self, state, action):
-        return self.q_table.get((state, action), 0.0)
-    
-    def update(self, state, action, reward, next_state):
-        current_q = self.get_q_value(state, action)
-        max_next_q = max([self.get_q_value(next_state, a) for a in self.actions])
-        new_q = current_q + self.lr * (reward + self.gamma * max_next_q - current_q)
-        self.q_table[(state, action)] = new_q
-    
-    def choose_action(self, state):
-        if random.random() < self.epsilon:
-            return random.choice(self.actions)
-        else:
-            q_values = [self.get_q_value(state, a) for a in self.actions]
-            return self.actions[np.argmax(q_values)]
-```
+**Q-learning简单理解：**
+- 目标：学习在每个状态下做什么动作最好
+- 方法：不断尝试，根据奖励更新策略
 
-### 1.4 模型评估与选择
+### 1.4 模型评估
 
-**Q: 解释交叉验证的种类和适用场景？**
+**Q: 常见的模型评估指标有哪些？**
 
-**常见交叉验证方法：**
+**分类问题：**
+- **准确率(Accuracy)**：预测正确的比例
+- **精确率(Precision)**：预测为正类中真正正类的比例
+- **召回率(Recall)**：真正正类中被预测为正类的比例
+- **F1分数**：精确率和召回率的平衡
 
-1. **K折交叉验证**：适用于一般情况
-2. **分层K折**：适用于分类问题，保持类别比例
-3. **留一法(LOOCV)**：适用于小数据集
-4. **时间序列交叉验证**：适用于时序数据
+**回归问题：**
+- **MSE(均方误差)**：预测值与真实值差的平方的平均
+- **MAE(平均绝对误差)**：预测值与真实值差的绝对值的平均
+- **R²(决定系数)**：模型解释数据变化的比例
 
-```python
-from sklearn.model_selection import (
-    KFold, StratifiedKFold, LeaveOneOut, TimeSeriesSplit
-)
+**Q: 什么是交叉验证？**
 
-def cross_validation_demo():
-    """交叉验证方法演示"""
-    
-    # K折交叉验证
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    
-    # 分层K折
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    
-    # 时间序列交叉验证
-    tscv = TimeSeriesSplit(n_splits=5)
-    
-    # 使用示例
-    for train_idx, val_idx in kf.split(X):
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
-        
-        # 训练和评估模型
-        model.fit(X_train, y_train)
-        score = model.score(X_val, y_val)
-```
+**简单理解：**
+- 把数据分成K份，轮流用K-1份训练，1份测试
+- 目的：更全面地评估模型性能
+- 常用：5折交叉验证
 
-## 2. 深度学习
+## 2. 深度学习基础
 
-### 2.1 神经网络基础
+### 2.1 神经网络
 
-**Q: 解释反向传播算法的原理？**
+**Q: 什么是神经网络？**
 
-**反向传播核心步骤：**
-1. **前向传播**：计算输出和损失
-2. **反向传播**：计算梯度
-3. **参数更新**：使用梯度下降更新权重
+**基本概念：**
+- **神经元**：最基本的计算单元，接收输入、加权求和、通过激活函数输出
+- **层**：多个神经元组成一层
+- **权重**：连接的强度，通过学习调整
+- **偏置**：每个神经元的起始值
 
-**数学原理：**
-```python
-import numpy as np
+**工作原理：**
+1. 输入数据从第一层传到最后一层（前向传播）
+2. 计算预测结果与真实结果的差距（损失函数）
+3. 从输出层向输入层传播误差（反向传播）
+4. 根据误差调整权重和偏置（梯度下降）
 
-class SimpleNeuralNetwork:
-    def __init__(self, input_size, hidden_size, output_size):
-        # 初始化权重
-        self.W1 = np.random.randn(input_size, hidden_size) * 0.01
-        self.b1 = np.zeros((1, hidden_size))
-        self.W2 = np.random.randn(hidden_size, output_size) * 0.01
-        self.b2 = np.zeros((1, output_size))
-    
-    def sigmoid(self, x):
-        return 1 / (1 + np.exp(-np.clip(x, -250, 250)))
-    
-    def sigmoid_derivative(self, x):
-        return x * (1 - x)
-    
-    def forward(self, X):
-        self.z1 = np.dot(X, self.W1) + self.b1
-        self.a1 = self.sigmoid(self.z1)
-        self.z2 = np.dot(self.a1, self.W2) + self.b2
-        self.a2 = self.sigmoid(self.z2)
-        return self.a2
-    
-    def backward(self, X, y, output):
-        m = X.shape[0]
-        
-        # 输出层梯度
-        dz2 = output - y
-        dW2 = (1/m) * np.dot(self.a1.T, dz2)
-        db2 = (1/m) * np.sum(dz2, axis=0, keepdims=True)
-        
-        # 隐藏层梯度
-        dz1 = np.dot(dz2, self.W2.T) * self.sigmoid_derivative(self.a1)
-        dW1 = (1/m) * np.dot(X.T, dz1)
-        db1 = (1/m) * np.sum(dz1, axis=0, keepdims=True)
-        
-        return dW1, db1, dW2, db2
-    
-    def update_parameters(self, dW1, db1, dW2, db2, learning_rate):
-        self.W1 -= learning_rate * dW1
-        self.b1 -= learning_rate * db1
-        self.W2 -= learning_rate * dW2
-        self.b2 -= learning_rate * db2
-```
+**Q: 常见的激活函数有哪些？**
 
-**Q: 常见的激活函数有哪些？各自的优缺点是什么？**
+**主要激活函数：**
+- **Sigmoid**：输出0-1之间，但容易梯度消失
+- **Tanh**：输出-1到1之间，比Sigmoid好一些
+- **ReLU**：简单有效，负数输出0，正数不变
+- **Leaky ReLU**：解决ReLU的“死亡”问题
 
-**激活函数对比：**
-
-```python
-import numpy as np
-import matplotlib.pyplot as plt
-
-def activation_functions():
-    x = np.linspace(-5, 5, 100)
-    
-    # Sigmoid
-    sigmoid = 1 / (1 + np.exp(-x))
-    sigmoid_grad = sigmoid * (1 - sigmoid)
-    
-    # Tanh
-    tanh = np.tanh(x)
-    tanh_grad = 1 - tanh**2
-    
-    # ReLU
-    relu = np.maximum(0, x)
-    relu_grad = (x > 0).astype(float)
-    
-    # Leaky ReLU
-    leaky_relu = np.where(x > 0, x, 0.01 * x)
-    leaky_grad = np.where(x > 0, 1, 0.01)
-    
-    # ELU
-    alpha = 1.0
-    elu = np.where(x > 0, x, alpha * (np.exp(x) - 1))
-    elu_grad = np.where(x > 0, 1, elu + alpha)
-    
-    return {
-        'sigmoid': (sigmoid, sigmoid_grad),
-        'tanh': (tanh, tanh_grad),
-        'relu': (relu, relu_grad),
-        'leaky_relu': (leaky_relu, leaky_grad),
-        'elu': (elu, elu_grad)
-    }
-```
-
-**激活函数特点：**
-- **Sigmoid**：输出0-1，存在梯度消失问题
-- **Tanh**：输出-1到1，比Sigmoid好但仍有梯度消失
-- **ReLU**：解决梯度消失，但有神经元死亡问题
-- **Leaky ReLU**：解决ReLU死亡问题
-- **ELU**：结合ReLU和Sigmoid优点
+**各自特点：**
+- ReLU最常用，计算简单效果好
+- Sigmoid用于输出层的二分类
+- Tanh用于隐藏层，比Sigmoid收敛快
 
 ### 2.2 卷积神经网络
 
-**Q: 解释卷积层、池化层的作用和参数？**
+**Q: 什么是卷积神经网络？**
 
-**卷积层参数：**
-- **卷积核大小**：通常3x3或5x5
-- **步长(Stride)**：控制输出尺寸
-- **填充(Padding)**：保持尺寸或减少边界效应
-- **通道数**：特征图数量
+**基本概念：**
+- **卷积层**：用小窗口(卷积核)扫描图像，提取特征
+- **池化层**：减小图像尺寸，保留主要信息
+- **全连接层**：最后用于分类或预测
 
-**池化层作用：**
-- 降维减少参数
-- 提供平移不变性
-- 扩大感受野
+**主要参数：**
+- **卷积核尺寸**：常用3x3或5x5
+- **步长(Stride)**：卷积核移动的步骤
+- **填充(Padding)**：在边缘加零，保持尺寸
+- **通道数**：输出特征图的数量
 
-```python
-import torch
-import torch.nn as nn
-
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes=10):
-        super(SimpleCNN, self).__init__()
-        
-        # 卷积块1
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # 卷积块2
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # 全连接层
-        self.fc = nn.Linear(64 * 8 * 8, num_classes)
-        self.dropout = nn.Dropout(0.5)
-    
-    def forward(self, x):
-        # 卷积块1
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu1(x)
-        x = self.pool1(x)
-        
-        # 卷积块2
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu2(x)
-        x = self.pool2(x)
-        
-        # 展平
-        x = x.view(x.size(0), -1)
-        x = self.dropout(x)
-        x = self.fc(x)
-        
-        return x
-```
+**优势：**
+- 适合处理图像数据
+- 参数共享，减少计算量
+- 对位置变化不敏感
 
 ### 2.3 循环神经网络
 
-**Q: LSTM和GRU的区别和优势？**
+**Q: 什么是循环神经网络？**
 
-**LSTM特点：**
-- 三个门：遗忘门、输入门、输出门
-- 细胞状态和隐藏状态
-- 有效解决长期依赖问题
+**基本概念：**
+- **序列数据**：有时间顺序的数据，如文本、语音
+- **记忆能力**：能记住之前的信息
+- **参数共享**：每个时间步使用相同参数
 
-**GRU特点：**
-- 两个门：重置门、更新门
-- 参数更少，训练更快
-- 性能接近LSTM
+**主要类型：**
+- **基础RNN**：最简单的RNN，但容易梯度消失
+- **LSTM**：长短期记忆网络，解决长期依赖问题
+- **GRU**：门控循环单元，比LSTM简单但效果接近
 
-```python
-import torch
-import torch.nn as nn
+**LSTM vs GRU：**
+- LSTM：3个门(遗忘门、输入门、输出门)，参数多
+- GRU：2个门(重置门、更新门)，参数少、训练快
 
-class LSTMModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, num_layers, num_classes):
-        super(LSTMModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, 
-                           batch_first=True, dropout=0.3)
-        self.fc = nn.Linear(hidden_size, num_classes)
-        self.dropout = nn.Dropout(0.5)
-    
-    def forward(self, x):
-        embedded = self.embedding(x)
-        lstm_out, (hidden, cell) = self.lstm(embedded)
-        
-        # 使用最后一个时间步的输出
-        output = self.dropout(lstm_out[:, -1, :])
-        output = self.fc(output)
-        
-        return output
+### 2.4 Transformer
 
-class GRUModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, num_layers, num_classes):
-        super(GRUModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.gru = nn.GRU(embed_size, hidden_size, num_layers, 
-                         batch_first=True, dropout=0.3)
-        self.fc = nn.Linear(hidden_size, num_classes)
-        self.dropout = nn.Dropout(0.5)
-    
-    def forward(self, x):
-        embedded = self.embedding(x)
-        gru_out, hidden = self.gru(embedded)
-        
-        # 使用最后一个时间步的输出
-        output = self.dropout(gru_out[:, -1, :])
-        output = self.fc(output)
-        
-        return output
-```
+**Q: 什么是Transformer？**
 
-### 2.4 Transformer架构
+**核心概念：**
+- **注意力机制**：能够关注输入序列中的任意位置
+- **自注意力**：序列中每个元素都可以与其他元素直接交互
+- **并行计算**：不像RNN需要顺序处理，可以并行
 
-**Q: 解释Transformer中的注意力机制？**
+**主要组成：**
+- **编码器(Encoder)**：理解输入序列
+- **解码器(Decoder)**：生成输出序列
+- **多头注意力**：同时关注多个方面的信息
 
-**自注意力机制原理：**
-```
-Attention(Q,K,V) = softmax(QK^T/√d_k)V
-```
-
-**多头注意力实现：**
-```python
-import torch
-import torch.nn as nn
-import math
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
-        assert d_model % num_heads == 0
-        
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.W_o = nn.Linear(d_model, d_model)
-        
-    def scaled_dot_product_attention(self, Q, K, V, mask=None):
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        attention_weights = torch.softmax(scores, dim=-1)
-        output = torch.matmul(attention_weights, V)
-        
-        return output, attention_weights
-    
-    def forward(self, query, key, value, mask=None):
-        batch_size = query.size(0)
-        
-        # 线性变换
-        Q = self.W_q(query)
-        K = self.W_k(key)
-        V = self.W_v(value)
-        
-        # 分割为多头
-        Q = Q.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        
-        # 注意力计算
-        attention_output, attention_weights = self.scaled_dot_product_attention(Q, K, V, mask)
-        
-        # 合并多头
-        attention_output = attention_output.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.d_model)
-        
-        # 最终线性变换
-        output = self.W_o(attention_output)
-        
-        return output, attention_weights
-```
-
-**Transformer优势：**
+**优势：**
 - 并行计算能力强
-- 长距离依赖建模能力
-- 可解释性好（注意力权重）
-- 预训练效果好
+- 长距离依赖建模能力好
+- 注意力权重可解释
+
+## 3. 自然语言处理
+
+**Q: 什么是词向量？**
+
+**基本概念：**
+- 把文字转换成数字向量，让计算机能理解
+- 相似的词在向量空间中距离较近
+
+**常见方法：**
+- **One-hot编码**：最简单，但维度高、稀疏
+- **Word2Vec**：通过上下文学习词向量
+- **GloVe**：结合全局统计和局部上下文
+- **FastText**：考虑子词信息
+
+**Q: 什么是注意力机制？**
+
+**简单理解：**
+- 让模型能够"专注"于输入中的重要部分
+- 不同位置的信息有不同的重要性权重
+
+**应用场景：**
+- 机器翻译：对齐源语言和目标语言
+- 文本摘要：找到关键句子
+- 问答系统：关注相关信息
+
+## 4. 计算机视觉
+
+**Q: 什么是目标检测？**
+
+**基本任务：**
+- 找到图像中的物体在哪里（位置）
+- 识别物体是什么（类别）
+
+**常见算法：**
+- **YOLO**："你只看一次"，速度快
+- **R-CNN系列**：精度高但速度慢
+- **SSD**：在速度和精度之间平衡
+
+**Q: 什么是语义分割？**
+
+**基本任务：**
+- 给图像中每个像素分配类别标签
+- 比目标检测更精细，需要像素级别的预测
+
+**常见方法：**
+- **FCN**：全卷积网络
+- **U-Net**：编码器-解码器结构
+- **DeepLab**：空洞卷积提高精度
+
+## 5. 大模型基础
+
+**Q: GPT和BERT有什么区别？**
+
+**主要区别：**
+
+| 特征 | GPT | BERT |
+|------|-----|------|
+| 架构 | 仅解码器 | 仅编码器 |
+| 训练方式 | 逐个预测下一个词 | 填空（预测遮盖词） |
+| 看数据方式 | 单向（从左到右） | 双向（同时看左右） |
+| 擅长任务 | 文本生成 | 文本理解 |
+
+**Q: 什么是预训练模型？**
+
+**基本概念：**
+- 先在大量数据上训练一个通用模型
+- 再针对具体任务进行微调
+- 好处：节省时间、提高效果
+
+**常见流程：**
+1. 预训练：在大数据集上学习通用特征
+2. 微调：针对具体任务调整参数
+3. 部署：在实际应用中使用
+
+## 6. 多模态生成模型
+
+### 6.1 文生图(Text-to-Image)
+
+**Q: 什么是文生图模型？**
+
+**基本概念：**
+- 根据文字描述生成对应的图像
+- 结合了自然语言理解和图像生成技术
+- 通常基于扩散模型或GAN架构
+
+**主流模型对比：**
+
+| 模型 | 技术架构 | 优点 | 缺点 |
+|------|--------|-----|-----|
+| **DALL-E 2** | 扩散模型 + CLIP | 图像质量高，控制性好 | 生成速度慢 |
+| **Midjourney** | 扩散模型 | 艺术效果出众 | 不开源，控制性有限 |
+| **Stable Diffusion** | Latent Diffusion | 开源，资源要求低 | 需要调参技巧 |
+| **DALL-E 3** | 改进扩散模型 | 文本理解能力强 | 成本高，访问限制 |
+| **Adobe Firefly** | 扩散模型 | 商业化成熟 | 创新性相对不足 |
+
+**技术原理：**
+- **CLIP编码**：将文本转换为特征向量
+- **扩散过程**：从噪声逐步生成清晰图像
+- **潜在空间**：在低维空间进行扩散，提高效率
+
+### 6.2 图生图(Image-to-Image)
+
+**Q: 图生图有哪些应用场景？**
+
+**主要任务类型：**
+- **风格转换**：将照片转换为绘画风格
+- **图像修复**：去噪、超分辨率、修复损坏
+- **内容编辑**：更改图像中的特定元素
+- **色彩化**：将黑白照片转为彩色
+
+**主流模型：**
+
+| 模型类型 | 代表模型 | 主要用途 |
+|---------|--------|--------|
+| **CycleGAN** | CycleGAN, DiscoGAN | 风格转换，无配对数据 |
+| **Pix2Pix** | Pix2Pix, Pix2PixHD | 有配对数据的转换 |
+| **ControlNet** | ControlNet + SD | 精细控制图像生成 |
+| **InstructPix2Pix** | InstructPix2Pix | 文本指令引导编辑 |
+| **Real-ESRGAN** | ESRGAN, Real-ESRGAN | 图像超分辨率 |
+
+**技术特点：**
+- **条件生成**：使用输入图像作为条件
+- **结构保持**：保持原图的基本结构
+- **细节增强**：改善图像的细节和质量
+
+### 6.3 文生视频(Text-to-Video)
+
+**Q: 文生视频模型的挑战有哪些？**
+
+**技术挑战：**
+- **时间一致性**：保持视频帧之间的连续性
+- **运动合理性**：生成符合物理规律的运动
+- **计算复杂度**：比图像生成需要更多资源
+- **内容控制**：精确控制视频内容和节奏
+
+**代表模型：**
+
+| 模型 | 发布时间 | 特点 | 限制 |
+|------|--------|-----|-----|
+| **Runway Gen-2** | 2023 | 商业化成熟，质量稳定 | 时长限制，成本高 |
+| **Pika Labs** | 2023 | 接近专业水准 | 数据访问限制 |
+| **Stable Video** | 2023 | 开源，可定制 | 需要技术背景 |
+| **Sora** | 2024 | 長视频生成，质量极高 | 未正式发布 |
+| **LumaAI Dream** | 2024 | 用户友好 | 功能相对简单 |
+
+**技术路线：**
+- **扩散模型**：基于图像扩散模型扩展
+- **自回归生成**：逐帧生成视频帧
+- **3D感知**：结合空间理解生成视频
+
+### 6.4 图生视频(Image-to-Video)
+
+**Q: 图生视频的优势是什么？**
+
+**主要优势：**
+- **结构约束**：有初始帧作为参考，更容易控制
+- **一致性保证**：保持视觉风格的一致性
+- **精确控制**：可以精确指定起始和结束状态
+- **计算效率**：比纯文生视频计算量小
+
+**应用场景：**
+- **照片动画化**：让静态照片“活起来”
+- **产品展示**：产品的360度展示视频
+- **艺术创作**：将艺术作品转为动态展示
+- **教育内容**：将图表、图解制作成动画
+
+**技术实现：**
+
+| 模型 | 输入要求 | 输出特点 |
+|------|--------|--------|
+| **RunwayML** | 单张图片 | 4秒短视频，质量高 |
+| **Stable Video Diffusion** | 图片+描述 | 开源，可定制 |
+| **Pika 1.0** | 图片+提示词 | 支持不同长宽比 |
+| **PixVerse** | 图片/文字 | 免费使用，质量适中 |
+
+### 6.5 模型选择指南
+
+**Q: 如何选择合适的生成模型？**
+
+**选择因素对比：**
+
+| 考虑因素 | 文生图 | 图生图 | 文生视频 | 图生视频 |
+|---------|-------|-------|---------|--------|
+| **创意自由度** | 高 | 中 | 高 | 中 |
+| **控制精度** | 中 | 高 | 低 | 高 |
+| **计算成本** | 低 | 低 | 高 | 中 |
+| **生成速度** | 快 | 快 | 慢 | 中 |
+| **结果可预测性** | 低 | 高 | 低 | 中 |
+
+**实际应用建议：**
+
+1. **初学者**：从 Stable Diffusion 或 Midjourney 开始
+2. **专业用户**：选择 ComfyUI + 多种模型组合
+3. **商业用途**：优先考虑 API 服务（OpenAI、Runway）
+4. **研究开发**：使用开源模型进行定制
+
+**最新发展趋势：**
+- **多模态融合**：一个模型支持多种输入输出
+- **实时生成**：生成速度不断提升
+- **精细控制**：更精确的局部编辑能力
+- **个性化定制**：根据用户偏好训练专属模型
+
+## 7. 实际应用
+
+**Q: 如何选择合适的算法？**
+
+**考虑因素：**
+- **数据量**：小数据用简单模型，大数据用复杂模型
+- **精度要求**：高精度用复杂模型，可接受低精度用简单模型
+- **速度需求**：实时应用选快速算法
+- **解释性**：需要解释的选简单模型
+
+**Q: 如何提高模型性能？**
+
+**数据方面：**
+- 收集更多、更好的数据
+- 数据清洗和预处理
+- 数据增强（旋转、缩放、噪声等）
+
+**模型方面：**
+- 调整超参数（学习率、正则化等）
+- 尝试不同的模型架构
+- 集成学习（多个模型投票）
+
+**训练方面：**
+- 使用预训练模型
+- 交叉验证调参（网格搜索、随机搜索）
+- 早停以防止过拟合
+
+---
+
+## 📚 总结
+
+这份AI面试基础题整理从最基本的概念入手，帮助你：
+
+**理解核心概念：**
+- 机器学习的基本原理
+- 深度学习的主要方法
+- 常见问题和解决方案
+
+**掌握实用技能：**
+- 算法选择和应用
+- 问题诊断和优化
+- 项目实施经验
+
+**面试建议：**
+- 重点理解基本概念，不要死记公式
+- 用自己的话解释技术原理
+- 结合实际例子说明应用场景
+- 对优缺点要有清楚认识
+
+**持续学习方向：**
+- 动手实践小项目
+- 阅读经典论文
+- 关注行业最新动态
+- 参与开源项目

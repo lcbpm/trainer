@@ -1,5 +1,16 @@
 # Python 函数传参规则
 
+## 📋 目录
+
+- [1. 位置参数（Positional Arguments）](#1-位置参数positional-arguments)
+- [2. 关键字参数（Keyword Arguments）](#2-关键字参数keyword-arguments)
+- [3. 默认参数（Default Arguments）](#3-默认参数default-arguments)
+- [4. 可变参数（Variable-length Arguments）](#4-可变参数variable-length-arguments)
+- [5. 参数顺序规则](#5-参数顺序规则)
+- [6. 解包传参](#6-解包传参)
+
+---
+
 ## 1. 位置参数（Positional Arguments）
 按照参数的位置顺序传递给函数。
 
